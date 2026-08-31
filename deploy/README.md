@@ -22,16 +22,28 @@ something I can do on your behalf):
   Personal Access Token that has `read:packages` scope. Create the token
   yourself at github.com/settings/tokens; don't paste it to me.
 
-## 3. Get the compose files onto the NAS
+## 3. Get it running
 
-Copy `deploy/docker-compose.yml` and a filled-in copy of `deploy/.env.example`
-(as `.env`, same directory) onto the NAS — e.g. via UGOS's File Manager, or
-`scp deploy/docker-compose.yml deploy/.env <nas-user>@<nas-host>:~/docker-monitor/`.
+`deploy/docker-compose.yml` is self-contained — every setting is inlined as
+`${VAR:-default}`, the same way flight-tracker's own `deploy/` compose file
+is, so the file itself is enough. No separate `.env` upload needed.
 
-## 4. Run it
+**Using a GUI Docker app** (UGOS's Docker app, Portainer, Synology
+Container Manager, etc.) — look for "Project"/"Compose" (not plain
+"Image"/"Container" creation, which doesn't take a multi-service compose
+file):
 
-Either through UGOS's Docker app (Container Manager-style UI: create a new
-Compose project, point it at the uploaded `docker-compose.yml`), or over SSH:
+1. Create a new project and paste in the contents of `deploy/docker-compose.yml`
+   (or upload the file, if your app takes a file instead of pasted text).
+2. Most of these apps scan the pasted YAML for `${...}` references and
+   generate a fill-in form from them (this is exactly what flight-tracker's
+   own deploy compose relies on) — that's where to set `NOTIFY_MODE=ntfy`
+   and `NTFY_TOPIC` once you're ready for real pushes, rather than
+   `console`. If your app doesn't do this, just edit the `:-default` value
+   directly in the pasted YAML for whatever you want to change.
+3. Deploy/build the project — this pulls both images and starts them.
+
+**Over SSH**, same file, no GUI:
 
 ```bash
 cd ~/docker-monitor
@@ -39,11 +51,17 @@ docker compose pull
 docker compose up -d
 ```
 
+(A real `.env` file dropped next to `docker-compose.yml` also works here —
+docker compose reads it automatically and it overrides the `:-defaults` —
+if you'd rather manage config that way than edit the compose file's
+defaults directly. See `deploy/.env.example` for the full list of names.)
+
 There's no web UI to open — docker-monitor has none, it only ever pushes
 alerts out. If `NOTIFY_MODE=ntfy`, subscribe from your phone or a browser
 at `http://<nas-ip>:${NTFY_PORT:-8080}` (the port the bundled `ntfy`
 service publishes) to actually receive them; leave `NOTIFY_MODE=console`
-and check `docker compose logs -f docker-monitor` if you just want to
+and check the `docker-monitor` container's logs (via the GUI's Logs tab,
+or `docker compose logs -f docker-monitor` over SSH) if you just want to
 confirm it's picking up the NAS's containers first.
 
 ## Updating
