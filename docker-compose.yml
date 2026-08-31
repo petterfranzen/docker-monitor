@@ -1,23 +1,53 @@
-# docker-monitor: watches every other container on this host and sends an
-# email when one breaks (stops unexpectedly, restart-loops, or its own
-# HEALTHCHECK reports unhealthy). See README.md for the full picture.
+# docker-monitor: watches every other container on this host and pushes an
+# ntfy notification when one breaks (stops unexpectedly, restart-loops,
+# fails its own HEALTHCHECK, goes silent, starts logging known trouble
+# text, or spikes in log volume). See README.md for the full picture.
 #
-# Mounts the host's Docker socket read-only — the standard, well-known
-# pattern used by cAdvisor/diun/what's-up-docker/watchtower for exactly
-# this reason: this needs to *observe* container state (list, inspect) but
-# should never be able to build, exec into, start/stop, or otherwise mutate
-# anything on the host.
+# docker-monitor itself mounts the host's Docker socket read-only — the
+# standard, well-known pattern used by cAdvisor/diun/what's-up-docker/
+# watchtower for exactly this reason: this needs to *observe* container
+# state (list, inspect, read logs) but should never be able to build, exec
+# into, start/stop, or otherwise mutate anything on the host.
+#
+# Also bundles a self-hosted ntfy (https://ntfy.sh) server, since the human
+# asked for self-hosted specifically — this is what NOTIFY_MODE=ntfy talks
+# to by default (NTFY_URL=http://ntfy:80, the compose-internal hostname).
+# Already run an ntfy server elsewhere on your NAS? Point NTFY_URL at that
+# instead and delete/comment out the `ntfy` service below — one ntfy server
+# is plenty for a whole NAS, you don't need a second one per monitored
+# stack.
 #
 # Usage:
 #   cp .env.example .env      # NOTIFY_MODE=console works with no changes
 #   docker compose up -d --build
 #   docker compose logs -f
+#
+# To actually receive pushes: set NOTIFY_MODE=ntfy and NTFY_TOPIC in .env,
+# then subscribe to that topic in the ntfy phone/web app pointed at
+# http://<this-host>:${NTFY_PORT:-8080} — see README.md's "ntfy setup" and
+# "Security notes" sections (topics are unauthenticated-readable by default).
 
 services:
+  ntfy:
+    image: binwiederhier/ntfy:latest
+    container_name: docker-monitor-ntfy
+    command: serve
+    restart: unless-stopped
+    volumes:
+      - ntfy-data:/var/lib/ntfy
+    ports:
+      - "${NTFY_PORT:-8080}:80"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
   docker-monitor:
     build: .
     container_name: docker-monitor
     restart: unless-stopped
+    depends_on:
+      - ntfy
     env_file:
       - .env
     volumes:
@@ -25,11 +55,14 @@ services:
       # notes" for what this does and doesn't protect against.
       - /var/run/docker.sock:/var/run/docker.sock:ro
     # Least-privilege hardening: this process only ever needs to read from
-    # the socket and send outbound SMTP, nothing here needs any Linux
-    # capability or elevated privilege.
+    # the socket, read container logs, and send an outbound HTTP POST to
+    # ntfy — nothing here needs any Linux capability or elevated privilege.
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
     # No ports published — this has no UI or API of its own. Alerts go out
-    # via email (or to stdout, in NOTIFY_MODE=console).
+    # via ntfy (or to stdout, in NOTIFY_MODE=console).
+
+volumes:
+  ntfy-data:

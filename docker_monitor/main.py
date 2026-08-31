@@ -9,6 +9,7 @@ is how it's meant to run for real on a NAS.
 from __future__ import annotations
 
 import logging
+import socket
 import time
 
 import docker
@@ -18,6 +19,18 @@ from .dockerstate import is_watched, snapshot_from_container
 from .logwatch import LogWatcher
 from .notifier import build_notifier
 from .rules import AlertEngine
+
+
+def _own_container_id(client) -> str:
+    """Best-effort id of the container this process itself is running in
+    (Docker sets the hostname to the container's short id by default).
+    Returns "" outside a container (e.g. local `python -m` dev runs) or if
+    lookup fails for any reason — callers treat that as "no self to skip."
+    """
+    try:
+        return client.containers.get(socket.gethostname()).id
+    except Exception:
+        return ""
 
 
 def run() -> None:
@@ -47,6 +60,18 @@ def run() -> None:
     log_watcher = LogWatcher(cfg) if cfg.log_monitoring_enabled else None
     notifier = build_notifier(cfg)
 
+    # Found live, during this project's own testing: docker-monitor's own
+    # log output necessarily echoes back the names/alert-type labels of
+    # whatever it's alerting on (e.g. "PROBLEM: some-container
+    # (log:rate_limited)"). If it also log-content-watches *itself*, that
+    # printed line can turn around and match one of its own patterns,
+    # firing an alert about itself that quotes itself — observed for real
+    # when a test container's own name happened to contain "ratelimit".
+    # State-watching itself has no such feedback risk (Docker's own
+    # running/exited/health status carries no alert-describing text), so
+    # only log-content watching skips this process's own container.
+    own_container_id = _own_container_id(client)
+
     while True:
         try:
             containers = client.containers.list(all=True)
@@ -57,7 +82,11 @@ def run() -> None:
             events = engine.evaluate(watched_snapshots)
 
             if log_watcher is not None:
-                running_pairs = [(c, s) for c, s in watched_pairs if s.state == "running"]
+                running_pairs = [
+                    (c, s)
+                    for c, s in watched_pairs
+                    if s.state == "running" and c.id != own_container_id
+                ]
                 events += log_watcher.evaluate(running_pairs)
 
             for event in events:

@@ -53,12 +53,26 @@ class LogPattern:
 def _default_patterns(cfg) -> list:
     patterns = []
     if cfg.log_pattern_rate_limited_enabled:
+        # Deliberately does NOT match a bare "429": found live, during this
+        # project's own testing, that a plain \b429\b regex reliably
+        # false-positives on ordinary chatty logs — it matched
+        # docker-monitor's own log line "10:01:22,429 DEBUG ..." on the
+        # *milliseconds field of its own timestamp* within seconds of
+        # running, and would just as easily match a port number, PID, or
+        # container-id fragment in any other container's logs. "429" alone
+        # is too short and too common a numeric token in unstructured text
+        # to be a safe generic default; the phrases below are what
+        # rate-limit/backoff logging actually tends to say and don't share
+        # that collision risk. A human who wants to match a bare status
+        # code for their own app's specific log format can add a tighter,
+        # context-scoped pattern (e.g. requiring "429" near "http" or
+        # "status") via LOG_PATTERNS_FILE — see README.
         patterns.append(
             LogPattern(
                 "rate_limited",
                 "warning",
                 re.compile(
-                    r"\b429\b|rate[ -]?limit|throttl|too many requests|backing off",
+                    r"rate[ -]?limit|throttl|too many requests|backing off",
                     re.IGNORECASE,
                 ),
             )
