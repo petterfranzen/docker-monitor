@@ -1,0 +1,35 @@
+# docker-monitor: watches every other container on this host and sends an
+# email when one breaks (stops unexpectedly, restart-loops, or its own
+# HEALTHCHECK reports unhealthy). See README.md for the full picture.
+#
+# Mounts the host's Docker socket read-only — the standard, well-known
+# pattern used by cAdvisor/diun/what's-up-docker/watchtower for exactly
+# this reason: this needs to *observe* container state (list, inspect) but
+# should never be able to build, exec into, start/stop, or otherwise mutate
+# anything on the host.
+#
+# Usage:
+#   cp .env.example .env      # NOTIFY_MODE=console works with no changes
+#   docker compose up -d --build
+#   docker compose logs -f
+
+services:
+  docker-monitor:
+    build: .
+    container_name: docker-monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # :ro is the whole security story here — see README.md's "Security
+      # notes" for what this does and doesn't protect against.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    # Least-privilege hardening: this process only ever needs to read from
+    # the socket and send outbound SMTP, nothing here needs any Linux
+    # capability or elevated privilege.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # No ports published — this has no UI or API of its own. Alerts go out
+    # via email (or to stdout, in NOTIFY_MODE=console).
