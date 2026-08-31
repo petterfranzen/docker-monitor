@@ -28,7 +28,7 @@ def _load_dotenv(path: Path = Path(".env")) -> None:
         os.environ.setdefault(key, value)
 
 
-def _split_csv(value: str) -> list[str]:
+def _split_csv(value: str) -> list:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
@@ -51,13 +51,22 @@ class Config:
     alert_on_recovery: bool
     log_level: str
 
-    smtp_host: str
-    smtp_port: int
-    smtp_tls_mode: str
-    smtp_username: str
-    smtp_password: str
-    smtp_from: str
-    smtp_to: list
+    # ntfy (https://ntfy.sh) push notifications.
+    ntfy_url: str
+    ntfy_topic: str
+
+    # Log-content monitoring (see docker_monitor/logwatch.py).
+    log_monitoring_enabled: bool
+    no_data_idle_seconds: int
+    no_data_exclude: list
+    log_pattern_rate_limited_enabled: bool
+    log_pattern_generic_error_enabled: bool
+    log_patterns_file: str
+    traffic_baseline_window_seconds: int
+    traffic_spike_multiplier: float
+    traffic_min_baseline_samples: int
+    traffic_grace_period_seconds: int
+    traffic_min_rate_lines_per_min: float
 
     @staticmethod
     def load() -> "Config":
@@ -65,9 +74,9 @@ class Config:
         env = os.environ
 
         notify_mode = env.get("NOTIFY_MODE", "console").strip().lower()
-        if notify_mode not in ("console", "email"):
+        if notify_mode not in ("console", "ntfy"):
             raise ValueError(
-                f"NOTIFY_MODE must be 'console' or 'email', got {notify_mode!r}"
+                f"NOTIFY_MODE must be 'console' or 'ntfy', got {notify_mode!r}"
             )
 
         cfg = Config(
@@ -83,28 +92,33 @@ class Config:
             label_exclude=_split_csv(env.get("LABEL_EXCLUDE", "")),
             alert_on_recovery=_bool(env.get("ALERT_ON_RECOVERY", ""), True),
             log_level=env.get("LOG_LEVEL", "INFO").strip().upper(),
-            smtp_host=env.get("SMTP_HOST", "").strip(),
-            smtp_port=int(env.get("SMTP_PORT", "587")),
-            smtp_tls_mode=env.get("SMTP_TLS_MODE", "starttls").strip().lower(),
-            smtp_username=env.get("SMTP_USERNAME", "").strip(),
-            smtp_password=env.get("SMTP_PASSWORD", ""),
-            smtp_from=env.get("SMTP_FROM", "").strip(),
-            smtp_to=_split_csv(env.get("SMTP_TO", "")),
+            ntfy_url=env.get("NTFY_URL", "http://ntfy:80").strip(),
+            ntfy_topic=env.get("NTFY_TOPIC", "").strip(),
+            log_monitoring_enabled=_bool(env.get("LOG_MONITORING_ENABLED", ""), True),
+            no_data_idle_seconds=int(env.get("NO_DATA_IDLE_SECONDS", "600")),
+            no_data_exclude=_split_csv(env.get("NO_DATA_EXCLUDE", "")),
+            log_pattern_rate_limited_enabled=_bool(
+                env.get("LOG_PATTERN_RATE_LIMITED_ENABLED", ""), True
+            ),
+            log_pattern_generic_error_enabled=_bool(
+                env.get("LOG_PATTERN_GENERIC_ERROR_ENABLED", ""), False
+            ),
+            log_patterns_file=env.get("LOG_PATTERNS_FILE", "").strip(),
+            traffic_baseline_window_seconds=int(
+                env.get("TRAFFIC_BASELINE_WINDOW_SECONDS", "1800")
+            ),
+            traffic_spike_multiplier=float(env.get("TRAFFIC_SPIKE_MULTIPLIER", "5")),
+            traffic_min_baseline_samples=int(
+                env.get("TRAFFIC_MIN_BASELINE_SAMPLES", "5")
+            ),
+            traffic_grace_period_seconds=int(
+                env.get("TRAFFIC_GRACE_PERIOD_SECONDS", "300")
+            ),
+            traffic_min_rate_lines_per_min=float(
+                env.get("TRAFFIC_MIN_RATE_LINES_PER_MIN", "2")
+            ),
         )
 
-        if cfg.notify_mode == "email":
-            missing = [
-                name
-                for name, value in (
-                    ("SMTP_HOST", cfg.smtp_host),
-                    ("SMTP_FROM", cfg.smtp_from),
-                )
-                if not value
-            ]
-            if not cfg.smtp_to:
-                missing.append("SMTP_TO")
-            if missing:
-                raise ValueError(
-                    "NOTIFY_MODE=email requires " + ", ".join(missing)
-                )
+        if cfg.notify_mode == "ntfy" and not cfg.ntfy_topic:
+            raise ValueError("NOTIFY_MODE=ntfy requires NTFY_TOPIC")
         return cfg

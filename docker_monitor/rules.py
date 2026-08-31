@@ -40,6 +40,10 @@ class Event:
     container_name: str
     recovered: bool
     detail: str
+    # "critical" (container-state problems: stopped/unhealthy/restart-loop)
+    # or "warning" (log-content-based problems — see logwatch.py). Drives
+    # notification priority/tags in notifier.py.
+    severity: str = "critical"
 
 
 @dataclass

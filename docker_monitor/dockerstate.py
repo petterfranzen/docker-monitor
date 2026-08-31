@@ -55,27 +55,26 @@ def is_watched(snapshot: ContainerSnapshot, cfg) -> bool:
     return True
 
 
+def snapshot_from_container(container) -> ContainerSnapshot:
+    attrs = container.attrs
+    state = attrs.get("State", {}) or {}
+    host_config = attrs.get("HostConfig", {}) or {}
+    config = attrs.get("Config", {}) or {}
+    health = (state.get("Health") or {}).get("Status")  # absent -> no healthcheck
+    return ContainerSnapshot(
+        id=container.id,
+        name=container.name,
+        image=config.get("Image", "?"),
+        state=state.get("Status", "unknown"),
+        exit_code=state.get("ExitCode"),
+        health=health,
+        restart_policy=(host_config.get("RestartPolicy") or {}).get("Name", ""),
+        restart_count=attrs.get("RestartCount", 0),
+        labels=config.get("Labels") or {},
+    )
+
+
 def fetch_snapshots(client) -> list:
     """Every container on the host, running or not (all=True) — we need to
     see exited containers too, that's the whole point of this tool."""
-    snapshots = []
-    for container in client.containers.list(all=True):
-        attrs = container.attrs
-        state = attrs.get("State", {}) or {}
-        host_config = attrs.get("HostConfig", {}) or {}
-        config = attrs.get("Config", {}) or {}
-        health = (state.get("Health") or {}).get("Status")  # absent -> no healthcheck
-        snapshots.append(
-            ContainerSnapshot(
-                id=container.id,
-                name=container.name,
-                image=config.get("Image", "?"),
-                state=state.get("Status", "unknown"),
-                exit_code=state.get("ExitCode"),
-                health=health,
-                restart_policy=(host_config.get("RestartPolicy") or {}).get("Name", ""),
-                restart_count=attrs.get("RestartCount", 0),
-                labels=config.get("Labels") or {},
-            )
-        )
-    return snapshots
+    return [snapshot_from_container(c) for c in client.containers.list(all=True)]
