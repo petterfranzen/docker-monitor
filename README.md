@@ -320,9 +320,13 @@ does there (see `../flight-tracker/deploy/`), with one addition:
 docker compose up -d --build
 ```
 
-or build once elsewhere and push to a registry / GHCR the way
-flight-tracker's `deploy/` does, if you'd rather not build on the NAS
-itself.
+or, since this repo now has the same "build once in CI, pull on the NAS"
+pipeline flight-tracker's `deploy/` does: pull the prebuilt
+`ghcr.io/petterfranzen/docker-monitor` image instead of building on the
+NAS itself. Use `deploy/docker-compose.yml` and `deploy/.env.example`
+in place of the root files, and see `deploy/README.md` for the full
+walkthrough (publishing, making the GHCR package pullable, and running
+it).
 
 **What's different from this dev machine:**
 

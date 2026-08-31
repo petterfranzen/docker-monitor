@@ -1,0 +1,55 @@
+# NAS-facing compose file: pulls the prebuilt docker-monitor image from
+# GHCR instead of building locally (see
+# .github/workflows/docker-publish.yml for how that gets published). Copy
+# this file + a .env (see .env.example) onto the NAS and run
+# `docker compose pull && docker compose up -d` — see deploy/README.md for
+# the full walkthrough.
+#
+# Unlike the repo-root docker-compose.yml (dev use, builds from source with
+# `build: .`), the only thing that changes here is where the
+# docker-monitor image comes from — the bundled ntfy service, the
+# read-only socket mount, and the capability hardening are all identical
+# to the root file. See the root README.md for the full picture of what
+# this stack does.
+
+name: docker-monitor
+
+services:
+  ntfy:
+    image: binwiederhier/ntfy:latest
+    container_name: docker-monitor-ntfy
+    command: serve
+    restart: unless-stopped
+    volumes:
+      - ntfy-data:/var/lib/ntfy
+    ports:
+      - "${NTFY_PORT:-8080}:80"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  docker-monitor:
+    image: ghcr.io/petterfranzen/docker-monitor:${IMAGE_TAG:-latest}
+    container_name: docker-monitor
+    restart: unless-stopped
+    depends_on:
+      - ntfy
+    env_file:
+      - .env
+    volumes:
+      # :ro is the whole security story here — see README.md's "Security
+      # notes" for what this does and doesn't protect against.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    # Least-privilege hardening: this process only ever needs to read from
+    # the socket, read container logs, and send an outbound HTTP POST to
+    # ntfy — nothing here needs any Linux capability or elevated privilege.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # No ports published — this has no UI or API of its own. Alerts go out
+    # via ntfy (or to stdout, in NOTIFY_MODE=console).
+
+volumes:
+  ntfy-data:
