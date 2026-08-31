@@ -68,21 +68,31 @@ class AlertEngine:
             stopped = snap.state not in RUNNING_STATES
 
             current = set()
+            if stopped:
+                current.add(ALERT_STOPPED)
             if unhealthy:
                 current.add(ALERT_UNHEALTHY)
             if restart_loop:
                 current.add(ALERT_RESTART_LOOP)
 
-            if not track.baseline_done:
-                if stopped and snap.restart_policy in ALWAYS_ON_POLICIES:
-                    current.add(ALERT_STOPPED)
-                track.baseline_done = True
-            elif stopped:
-                current.add(ALERT_STOPPED)
+            detail = self._detail(snap, restart_loop)
 
-            events.extend(
-                self._diff(track, current, snap.name, self._detail(snap, restart_loop))
-            )
+            if not track.baseline_done:
+                track.baseline_done = True
+                # Record ground truth directly rather than diffing against
+                # an empty set — otherwise a container that was *already*
+                # stopped when we started watching would look like a brand
+                # new transition on the very next poll, even though nothing
+                # changed. The one deliberate exception: a container whose
+                # restart policy says it should always be running is worth
+                # flagging immediately, even on the very first poll.
+                if ALERT_STOPPED in current and snap.restart_policy in ALWAYS_ON_POLICIES:
+                    events.append(
+                        Event(ALERT_STOPPED, snap.name, recovered=False, detail=detail)
+                    )
+                track.active_alerts = current
+            else:
+                events.extend(self._diff(track, current, snap.name, detail))
 
         # Containers that vanished entirely since the last poll (docker rm,
         # or a container started with --rm that exited).

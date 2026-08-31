@@ -46,6 +46,16 @@ def test_no_alert_on_baseline_for_already_stopped_container_without_policy():
     assert events == []
 
 
+def test_no_alert_on_second_poll_for_container_still_stopped_since_baseline():
+    # Regression: a container already stopped (no restart policy) when
+    # monitoring starts must not look like a fresh transition on the next
+    # poll just because it's still stopped.
+    engine = AlertEngine(make_cfg())
+    assert engine.evaluate([snap(name="c1", state="created", exit_code=0)]) == []
+    assert engine.evaluate([snap(name="c1", state="created", exit_code=0)]) == []
+    assert engine.evaluate([snap(name="c1", state="created", exit_code=0)]) == []
+
+
 def test_baseline_alerts_immediately_for_always_restart_policy_stopped():
     engine = AlertEngine(make_cfg())
     events = engine.evaluate(
