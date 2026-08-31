@@ -1,16 +1,28 @@
 # NAS-facing compose file: pulls the prebuilt docker-monitor image from
 # GHCR instead of building locally (see
-# .github/workflows/docker-publish.yml for how that gets published). Copy
-# this file + a .env (see .env.example) onto the NAS and run
-# `docker compose pull && docker compose up -d` — see deploy/README.md for
-# the full walkthrough.
+# .github/workflows/docker-publish.yml for how that gets published).
+#
+# Self-contained on purpose, the same way flight-tracker's deploy/
+# docker-compose.yml is: every setting is inlined below as
+# ${VAR_NAME:-default} rather than read from a separate .env file, so
+# pasting this one file into a GUI Docker app (Portainer/Container
+# Manager/UGOS-style "Project" compose editors all do this) is enough —
+# most of those UIs scan the pasted YAML for ${...} references and
+# generate a fill-in form from them automatically, no file upload needed.
+# Editing a default directly in this file (e.g. NOTIFY_MODE:-console ->
+# NOTIFY_MODE:-ntfy) works just as well if your UI doesn't do that.
+#
+# Prefer a real .env file instead (terminal/`docker compose` use)? Drop
+# one next to this file with any of the same names — docker compose reads
+# it automatically and it overrides the :-defaults below with no changes
+# needed here.
 #
 # Unlike the repo-root docker-compose.yml (dev use, builds from source with
 # `build: .`), the only thing that changes here is where the
 # docker-monitor image comes from — the bundled ntfy service, the
 # read-only socket mount, and the capability hardening are all identical
 # to the root file. See the root README.md for the full picture of what
-# this stack does.
+# this stack does and what every setting below actually controls.
 
 name: docker-monitor
 
@@ -35,11 +47,71 @@ services:
     restart: unless-stopped
     depends_on:
       - ntfy
-    env_file:
-      - .env
+    environment:
+      # "console" logs what WOULD be pushed to stdout, no ntfy needed —
+      # safe default, good for confirming this sees your containers before
+      # switching to real pushes. "ntfy" actually sends via NTFY_URL/TOPIC.
+      NOTIFY_MODE: ${NOTIFY_MODE:-console}
+      # Compose-internal hostname for the bundled ntfy service above.
+      # Pointing at an existing ntfy server elsewhere on the NAS instead?
+      # Change this and drop the ntfy service/NTFY_PORT mapping.
+      NTFY_URL: ${NTFY_URL:-http://ntfy:80}
+      # Required once NOTIFY_MODE=ntfy. Pick a hard-to-guess topic name —
+      # ntfy topics are unauthenticated-readable by default (see root
+      # README's "Security notes"), so treat it like a shared secret.
+      NTFY_TOPIC: ${NTFY_TOPIC:-}
+
+      # How often to check container state, in seconds.
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-30}
+
+      # Flag a container "restart-looping" once Docker's own restart
+      # counter for it climbs by this many within this many seconds.
+      RESTART_LOOP_THRESHOLD: ${RESTART_LOOP_THRESHOLD:-3}
+      RESTART_LOOP_WINDOW_SECONDS: ${RESTART_LOOP_WINDOW_SECONDS:-300}
+
+      # Scope: leave both blank to watch every container on the host.
+      # Comma-separated names/globs (e.g. "flight-tracker-*"); exclude
+      # always wins when a name matches both.
+      CONTAINER_INCLUDE: ${CONTAINER_INCLUDE:-}
+      CONTAINER_EXCLUDE: ${CONTAINER_EXCLUDE:-}
+      # Same idea, by label — each entry a bare key or key=value.
+      LABEL_INCLUDE: ${LABEL_INCLUDE:-}
+      LABEL_EXCLUDE: ${LABEL_EXCLUDE:-}
+
+      # Log-content monitoring (watches log TEXT, not just container
+      # state) — global on/off switch for everything below it.
+      LOG_MONITORING_ENABLED: ${LOG_MONITORING_ENABLED:-true}
+      # Alert if a running, watched container produces zero new log lines
+      # for longer than this many seconds.
+      NO_DATA_IDLE_SECONDS: ${NO_DATA_IDLE_SECONDS:-600}
+      # Names/globs to skip no-data checking for — containers that are
+      # legitimately quiet most of the time (e.g. a database with no
+      # active connections), comma-separated.
+      NO_DATA_EXCLUDE: ${NO_DATA_EXCLUDE:-}
+      # Built-in log-text pattern matches, each its own on/off switch.
+      LOG_PATTERN_RATE_LIMITED_ENABLED: ${LOG_PATTERN_RATE_LIMITED_ENABLED:-true}
+      # Off by default — noisy unless you know your stack's logs are
+      # clean of the words "error"/"exception"/"fatal" in normal use.
+      LOG_PATTERN_GENERIC_ERROR_ENABLED: ${LOG_PATTERN_GENERIC_ERROR_ENABLED:-false}
+      # Optional path (inside the container) to a JSON file of
+      # additional/overriding patterns — see root README for the format.
+      LOG_PATTERNS_FILE: ${LOG_PATTERNS_FILE:-}
+      # Traffic-spike detection: rolling baseline of log lines/minute per
+      # container; alerts if the current rate exceeds it by this
+      # multiplier, sustained for 2+ consecutive polls.
+      TRAFFIC_BASELINE_WINDOW_SECONDS: ${TRAFFIC_BASELINE_WINDOW_SECONDS:-1800}
+      TRAFFIC_SPIKE_MULTIPLIER: ${TRAFFIC_SPIKE_MULTIPLIER:-5}
+      TRAFFIC_MIN_BASELINE_SAMPLES: ${TRAFFIC_MIN_BASELINE_SAMPLES:-5}
+      TRAFFIC_GRACE_PERIOD_SECONDS: ${TRAFFIC_GRACE_PERIOD_SECONDS:-300}
+      TRAFFIC_MIN_RATE_LINES_PER_MIN: ${TRAFFIC_MIN_RATE_LINES_PER_MIN:-2}
+
+      # Also send a follow-up push when a problem clears.
+      ALERT_ON_RECOVERY: ${ALERT_ON_RECOVERY:-true}
+      # DEBUG / INFO / WARNING / ERROR
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
-      # :ro is the whole security story here — see README.md's "Security
-      # notes" for what this does and doesn't protect against.
+      # :ro is the whole security story here — see root README.md's
+      # "Security notes" for what this does and doesn't protect against.
       - /var/run/docker.sock:/var/run/docker.sock:ro
     # Least-privilege hardening: this process only ever needs to read from
     # the socket, read container logs, and send an outbound HTTP POST to
