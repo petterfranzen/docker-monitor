@@ -1,6 +1,7 @@
-# Small, single-purpose image: Python's own smtplib covers SMTP (no extra
-# dependency for that), so `docker` — the Engine API client — is the only
-# third-party package this needs. No web framework, no build step.
+# Small, single-purpose image: ntfy pushes go over Python's own
+# urllib.request (no extra dependency for that), so `docker` — the Engine
+# API client — is the only third-party package this needs. No web
+# framework, no build step.
 FROM python:3.12-slim
 
 WORKDIR /app
