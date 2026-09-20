@@ -9,24 +9,77 @@
 # Manager/UGOS-style "Project" compose editors all do this) is enough —
 # most of those UIs scan the pasted YAML for ${...} references and
 # generate a fill-in form from them automatically, no file upload needed.
-# Editing a default directly in this file (e.g. NOTIFY_MODE:-console ->
-# NOTIFY_MODE:-ntfy) works just as well if your UI doesn't do that.
 #
 # Prefer a real .env file instead (terminal/`docker compose` use)? Drop
 # one next to this file with any of the same names — docker compose reads
 # it automatically and it overrides the :-defaults below with no changes
 # needed here.
 #
-# Unlike the repo-root docker-compose.yml (dev use, builds from source with
-# `build: .`), the only thing that changes here is where the
-# docker-monitor image comes from — the bundled ntfy service, the
-# read-only socket mount, and the capability hardening are all identical
-# to the root file. See the root README.md for the full picture of what
-# this stack does and what every setting below actually controls.
+# THREE things differ from the repo-root (dev) compose file:
+#
+#  1. The image comes from GHCR instead of `build: .`.
+#  2. A docker-socket-proxy sits between this and the real Docker socket;
+#     docker-monitor never sees /var/run/docker.sock at all.
+#  3. You must mount your stacks directory and a projects.json, or nothing
+#     is controllable — see the `volumes` on docker-monitor below.
+#
+# Before exposing this to the internet, read the root README's "Security
+# notes". The short version: the socket proxy is NOT the thing protecting
+# you, the guest/owner split and the project registry are.
 
 name: docker-monitor
 
 services:
+  # Everything the monitor does to Docker goes through here. Compare the
+  # flags below with the full list at
+  # https://github.com/Tecnativa/docker-socket-proxy — anything not
+  # explicitly enabled is refused with a 403 by the proxy itself.
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: docker-monitor-socket-proxy
+    restart: unless-stopped
+    environment:
+      # Read paths: what the alerting side needs (list/inspect/logs).
+      CONTAINERS: 1
+      # Write paths: what `docker compose up/stop/pull` needs.
+      POST: 1
+      IMAGES: 1
+      NETWORKS: 1
+      VOLUMES: 1
+      # Compose calls these on startup to negotiate API version.
+      PING: 1
+      VERSION: 1
+      INFO: 1
+      # Explicitly OFF. EXEC is the important one — it's the difference
+      # between "can manage containers" and "can run arbitrary commands
+      # inside any of them, including ones holding secrets".
+      EXEC: 0
+      BUILD: 0
+      COMMIT: 0
+      SWARM: 0
+      SECRETS: 0
+      CONFIGS: 0
+      NODES: 0
+      PLUGINS: 0
+      SYSTEM: 0
+      AUTH: 0
+      DISTRIBUTION: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    # Not published to the host: only other services on this compose
+    # network should ever reach it.
+    expose:
+      - "2375"
+    cap_drop:
+      - ALL
+    cap_add:
+      # haproxy inside the proxy image binds a port and drops privileges.
+      - CHOWN
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+
   ntfy:
     image: binwiederhier/ntfy:latest
     container_name: docker-monitor-ntfy
@@ -47,81 +100,112 @@ services:
     restart: unless-stopped
     depends_on:
       - ntfy
+      - socket-proxy
+    ports:
+      # The control API. Put a reverse proxy in front of this (the
+      # portfolio's nginx proxies /lab-api/ to it) rather than exposing
+      # the port to the internet directly — that's what makes
+      # TRUST_PROXY_HEADERS below safe to turn on.
+      - "${API_BIND:-127.0.0.1}:${API_PORT:-8000}:8000"
     environment:
+      # ---- notifications ------------------------------------------------
       # "console" logs what WOULD be pushed to stdout, no ntfy needed —
       # safe default, good for confirming this sees your containers before
       # switching to real pushes. "ntfy" actually sends via NTFY_URL/TOPIC.
       NOTIFY_MODE: ${NOTIFY_MODE:-console}
-      # Compose-internal hostname for the bundled ntfy service above.
-      # Pointing at an existing ntfy server elsewhere on the NAS instead?
-      # Change this and drop the ntfy service/NTFY_PORT mapping.
       NTFY_URL: ${NTFY_URL:-http://ntfy:80}
       # Required once NOTIFY_MODE=ntfy. Pick a hard-to-guess topic name —
       # ntfy topics are unauthenticated-readable by default (see root
       # README's "Security notes"), so treat it like a shared secret.
       NTFY_TOPIC: ${NTFY_TOPIC:-}
+      ALERT_ON_RECOVERY: ${ALERT_ON_RECOVERY:-true}
 
-      # How often to check container state, in seconds.
+      # ---- talking to Docker ---------------------------------------------
+      # The proxy, never the raw socket. Both docker-py and the bundled
+      # `docker compose` CLI read this.
+      DOCKER_HOST: ${DOCKER_HOST:-tcp://socket-proxy:2375}
+
+      # ---- polling -------------------------------------------------------
       POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-30}
+      # Used instead of the above while a project is mid-operation or
+      # holding a lease, so a dashboard someone is watching a stack boot on
+      # updates at a believable rate.
+      ACTIVE_POLL_INTERVAL_SECONDS: ${ACTIVE_POLL_INTERVAL_SECONDS:-5}
 
-      # Flag a container "restart-looping" once Docker's own restart
-      # counter for it climbs by this many within this many seconds.
+      # ---- alerting ------------------------------------------------------
       RESTART_LOOP_THRESHOLD: ${RESTART_LOOP_THRESHOLD:-3}
       RESTART_LOOP_WINDOW_SECONDS: ${RESTART_LOOP_WINDOW_SECONDS:-300}
-
-      # Scope: leave both blank to watch every container on the host.
-      # Comma-separated names/globs (e.g. "flight-tracker-*"); exclude
-      # always wins when a name matches both.
       CONTAINER_INCLUDE: ${CONTAINER_INCLUDE:-}
       CONTAINER_EXCLUDE: ${CONTAINER_EXCLUDE:-}
-      # Same idea, by label — each entry a bare key or key=value.
       LABEL_INCLUDE: ${LABEL_INCLUDE:-}
       LABEL_EXCLUDE: ${LABEL_EXCLUDE:-}
-
-      # Log-content monitoring (watches log TEXT, not just container
-      # state) — global on/off switch for everything below it.
       LOG_MONITORING_ENABLED: ${LOG_MONITORING_ENABLED:-true}
-      # Alert if a running, watched container produces zero new log lines
-      # for longer than this many seconds.
       NO_DATA_IDLE_SECONDS: ${NO_DATA_IDLE_SECONDS:-600}
-      # Names/globs to skip no-data checking for — containers that are
-      # legitimately quiet most of the time (e.g. a database with no
-      # active connections), comma-separated.
       NO_DATA_EXCLUDE: ${NO_DATA_EXCLUDE:-}
-      # Built-in log-text pattern matches, each its own on/off switch.
       LOG_PATTERN_RATE_LIMITED_ENABLED: ${LOG_PATTERN_RATE_LIMITED_ENABLED:-true}
-      # Off by default — noisy unless you know your stack's logs are
-      # clean of the words "error"/"exception"/"fatal" in normal use.
       LOG_PATTERN_GENERIC_ERROR_ENABLED: ${LOG_PATTERN_GENERIC_ERROR_ENABLED:-false}
-      # Optional path (inside the container) to a JSON file of
-      # additional/overriding patterns — see root README for the format.
       LOG_PATTERNS_FILE: ${LOG_PATTERNS_FILE:-}
-      # Traffic-spike detection: rolling baseline of log lines/minute per
-      # container; alerts if the current rate exceeds it by this
-      # multiplier, sustained for 2+ consecutive polls.
       TRAFFIC_BASELINE_WINDOW_SECONDS: ${TRAFFIC_BASELINE_WINDOW_SECONDS:-1800}
       TRAFFIC_SPIKE_MULTIPLIER: ${TRAFFIC_SPIKE_MULTIPLIER:-5}
       TRAFFIC_MIN_BASELINE_SAMPLES: ${TRAFFIC_MIN_BASELINE_SAMPLES:-5}
       TRAFFIC_GRACE_PERIOD_SECONDS: ${TRAFFIC_GRACE_PERIOD_SECONDS:-300}
       TRAFFIC_MIN_RATE_LINES_PER_MIN: ${TRAFFIC_MIN_RATE_LINES_PER_MIN:-2}
 
-      # Also send a follow-up push when a problem clears.
-      ALERT_ON_RECOVERY: ${ALERT_ON_RECOVERY:-true}
-      # DEBUG / INFO / WARNING / ERROR
+      # ---- app phase reporting -------------------------------------------
+      # Reads [phase:...] markers out of container logs — see the root
+      # README's "Phase reporting" for the convention apps follow.
+      PHASE_TRACKING_ENABLED: ${PHASE_TRACKING_ENABLED:-true}
+      # A phase older than this is treated as unknown rather than current.
+      PHASE_STALE_SECONDS: ${PHASE_STALE_SECONDS:-900}
+
+      # ---- control API ----------------------------------------------------
+      API_ENABLED: ${API_ENABLED:-true}
+      API_HOST: ${API_HOST:-0.0.0.0}
+      API_PORT: ${API_PORT:-8000}
+      # Registry of what may be controlled, mounted read-only below.
+      # Without it nothing is startable — projects are listed read-only.
+      PROJECTS_FILE: ${PROJECTS_FILE:-/config/projects.json}
+      LEASES_FILE: ${LEASES_FILE:-/data/leases.json}
+      # REQUIRED for restart/update, and for starting anything not marked
+      # guest_controllable. Generate one: `openssl rand -hex 32`.
+      # Leave it empty and those operations are refused for everyone,
+      # which is the safe failure direction but probably not what you want.
+      CONTROL_TOKEN: ${CONTROL_TOKEN:-}
+      # Only turn this on when something you control terminates connections
+      # in front of this and rewrites X-Forwarded-For. With the port
+      # exposed directly, a client can forge the header and get a fresh
+      # identity per request, defeating the per-IP limits below.
+      TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-false}
+
+      # ---- guest limits ----------------------------------------------------
+      # How long a visitor's demo runs before it's stopped automatically.
+      DEFAULT_TTL_MINUTES: ${DEFAULT_TTL_MINUTES:-60}
+      # How many guest-started projects may run at once.
+      MAX_CONCURRENT_GUEST_PROJECTS: ${MAX_CONCURRENT_GUEST_PROJECTS:-1}
+      # How many compose operations may run in parallel.
+      MAX_CONCURRENT_OPERATIONS: ${MAX_CONCURRENT_OPERATIONS:-2}
+      # Per-IP: this many control requests per window, and per day.
+      # Local/private addresses are exempt from both.
+      GUEST_RATE_WINDOW_SECONDS: ${GUEST_RATE_WINDOW_SECONDS:-600}
+      GUEST_MAX_REQUESTS_PER_WINDOW: ${GUEST_MAX_REQUESTS_PER_WINDOW:-3}
+      GUEST_MAX_REQUESTS_PER_DAY: ${GUEST_MAX_REQUESTS_PER_DAY:-20}
+
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     volumes:
-      # :ro is the whole security story here — see root README.md's
-      # "Security notes" for what this does and doesn't protect against.
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    # Least-privilege hardening: this process only ever needs to read from
-    # the socket, read container logs, and send an outbound HTTP POST to
-    # ntfy — nothing here needs any Linux capability or elevated privilege.
+      # Leases must outlive the container — see docker_monitor/leases.py.
+      - monitor-data:/data
+      # The registry of controllable projects, and the compose files it
+      # points at. BOTH read-only: this process must never be able to
+      # rewrite the list of what it's allowed to control, nor the compose
+      # files describing how.
+      - ${PROJECTS_CONFIG:-./projects.json}:/config/projects.json:ro
+      - ${STACKS_DIR:-./stacks}:/stacks:ro
+      # NOTE: no /var/run/docker.sock mount. That's the point of the proxy.
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
-    # No ports published — this has no UI or API of its own. Alerts go out
-    # via ntfy (or to stdout, in NOTIFY_MODE=console).
 
 volumes:
   ntfy-data:
+  monitor-data:

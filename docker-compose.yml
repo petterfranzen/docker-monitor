@@ -1,31 +1,32 @@
-# docker-monitor: watches every other container on this host and pushes an
-# ntfy notification when one breaks (stops unexpectedly, restart-loops,
-# fails its own HEALTHCHECK, goes silent, starts logging known trouble
-# text, or spikes in log volume). See README.md for the full picture.
+# docker-monitor: watches every other container on this host, pushes an
+# ntfy notification when one breaks, and — since it grew a control API —
+# starts, stops and updates the Compose projects listed in its registry.
+# See README.md for the full picture.
 #
-# docker-monitor itself mounts the host's Docker socket read-only — the
-# standard, well-known pattern used by cAdvisor/diun/what's-up-docker/
-# watchtower for exactly this reason: this needs to *observe* container
-# state (list, inspect, read logs) but should never be able to build, exec
-# into, start/stop, or otherwise mutate anything on the host.
+# This root file is the DEV shape: it builds from source and talks to the
+# host's Docker socket directly, because on a dev machine you're iterating
+# on the code and the socket is already right there. The NAS shape is
+# deploy/docker-compose.yml, which pulls a prebuilt image and puts a
+# socket proxy in front of the daemon — use that one for anything
+# long-lived or internet-reachable.
+#
+# Note the socket is mounted read-WRITE here, unlike earlier versions of
+# this file. Starting and stopping containers is a write operation; there
+# is no way around that. What stops it from being a general-purpose
+# remote-control hole is the API's own guest/owner split and the project
+# registry — see README.md's "Security notes".
 #
 # Also bundles a self-hosted ntfy (https://ntfy.sh) server, since the human
 # asked for self-hosted specifically — this is what NOTIFY_MODE=ntfy talks
 # to by default (NTFY_URL=http://ntfy:80, the compose-internal hostname).
 # Already run an ntfy server elsewhere on your NAS? Point NTFY_URL at that
-# instead and delete/comment out the `ntfy` service below — one ntfy server
-# is plenty for a whole NAS, you don't need a second one per monitored
-# stack.
+# instead and delete/comment out the `ntfy` service below.
 #
 # Usage:
 #   cp .env.example .env      # NOTIFY_MODE=console works with no changes
 #   docker compose up -d --build
 #   docker compose logs -f
-#
-# To actually receive pushes: set NOTIFY_MODE=ntfy and NTFY_TOPIC in .env,
-# then subscribe to that topic in the ntfy phone/web app pointed at
-# http://<this-host>:${NTFY_PORT:-8080} — see README.md's "ntfy setup" and
-# "Security notes" sections (topics are unauthenticated-readable by default).
+#   curl localhost:8000/api/projects
 
 services:
   ntfy:
@@ -50,19 +51,29 @@ services:
       - ntfy
     env_file:
       - .env
+    ports:
+      # The control API. Bound to localhost on a dev machine — there's no
+      # reverse proxy in front of it here, and nothing on this port should
+      # be reachable from the rest of the LAN by accident.
+      - "127.0.0.1:${API_PORT:-8000}:8000"
     volumes:
-      # :ro is the whole security story here — see README.md's "Security
-      # notes" for what this does and doesn't protect against.
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    # Least-privilege hardening: this process only ever needs to read from
-    # the socket, read container logs, and send an outbound HTTP POST to
-    # ntfy — nothing here needs any Linux capability or elevated privilege.
+      # Read-write: the control API starts and stops containers. See the
+      # header comment and README.md's "Security notes".
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Leases must outlive the container, or a restart orphans whatever a
+      # guest started — see docker_monitor/leases.py.
+      - monitor-data:/data
+      # The project registry, and the compose files it points at. Mounted
+      # read-only: this process must never be able to rewrite the list of
+      # what it's allowed to control.
+      - ./projects.example.json:/config/projects.json:ro
+      - ${STACKS_DIR:-./stacks}:/stacks:ro
+    # Least-privilege hardening: nothing here needs a Linux capability.
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
-    # No ports published — this has no UI or API of its own. Alerts go out
-    # via ntfy (or to stdout, in NOTIFY_MODE=console).
 
 volumes:
   ntfy-data:
+  monitor-data:

@@ -1,2 +1,4 @@
 -r requirements.txt
 pytest>=8
+# fastapi's TestClient is built on starlette's, which needs httpx.
+httpx>=0.27

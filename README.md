@@ -1,13 +1,27 @@
 # docker-monitor
 
-A small, standalone service that watches Docker containers on a host and
-pushes an [ntfy](https://ntfy.sh) notification when one breaks. Built for a
-home NAS running several independent `docker compose` stacks (this dev
-machine's [flight-tracker](../flight-tracker) is one of them) — nobody
-currently finds out when a container silently crashes, restart-loops,
-fails its own healthcheck, or goes quiet without actually stopping. This
-watches *any* container on the host by default; it has no special
-knowledge of flight-tracker or any other specific stack.
+A small, standalone service that watches the Docker containers on a host,
+pushes an [ntfy](https://ntfy.sh) notification when one breaks, and — via
+a small HTTP API — starts, stops and updates the `docker compose` projects
+it has been told it may control.
+
+Built for a home NAS running several independent Compose stacks (this dev
+machine's [flight-tracker](../flight-tracker) is one of them). It does two
+jobs that share one view of the host:
+
+1. **Alerting.** Nobody finds out when a container silently crashes,
+   restart-loops, fails its own healthcheck, or goes quiet without
+   actually stopping. This watches *any* container on the host by default
+   and pushes when one breaks.
+2. **Control.** Projects that don't need to run 24/7 shouldn't. The API
+   lets something else — in practice, [the portfolio's
+   dashboard](../portfolio) — show what's running, what it's *doing*, and
+   start a stack on demand for a visitor, with a lease that stops it again
+   an hour later whether or not anyone comes back.
+
+The alerting half has no special knowledge of any stack. The control half
+knows only what a registry file explicitly lists; see
+[Controlling projects](#controlling-projects).
 
 ## What it does
 
@@ -58,9 +72,11 @@ with `restart: always`/`unless-stopped` that's already down at startup,
 which is flagged immediately, since that policy is a direct statement of
 intent that it should be running.
 
-**Not in scope for v1** (see "Decisions for the human" below): CPU/memory
-resource-threshold alerting, a UI/dashboard, non-ntfy notification
-channels, and pausing alerts during a planned maintenance window.
+**Still not in scope** (see "Decisions for the human" below): CPU/memory
+resource-threshold alerting, non-ntfy notification channels, and pausing
+alerts during a planned maintenance window. A UI is out of scope *here*
+specifically — this serves an API; the dashboard that consumes it lives in
+[the portfolio](../portfolio).
 
 ## Tech stack — and why
 
@@ -75,20 +91,32 @@ channels, and pausing alerts during a planned maintenance window.
   `urllib.request`, no client library needed) to a topic on a self-hosted
   ntfy server (bundled in `docker-compose.yml`) or any ntfy server you
   already run.
-- This is a background poll loop with no HTTP surface of its own, so no
-  web framework. A plain `while True: ... ; time.sleep(...)` loop is
-  simpler and easier to reason about than pulling in a scheduler library
-  for one job. Log tailing is a periodic incremental fetch
+- The poll loop stays a plain `while True: ... ; sleep(...)` — simpler and
+  easier to reason about than pulling in a scheduler library for one job.
+  (It now runs as an asyncio task alongside the API rather than owning the
+  process, but it's the same loop.) Log tailing is a periodic incremental
+  fetch
   (`since=<last checkpoint>`) each poll cycle rather than a persistent
   streaming connection, for the same reason — it fits the existing
   poll-loop model and avoids a background thread + reconnect/backoff per
   container.
+- **FastAPI + uvicorn** serve the control API. This is a deliberate break
+  from the "one dependency" line above, and it cost something: the image
+  is bigger and there's a web stack to keep current. The alternative was
+  hand-rolling routing, concurrent request handling and Server-Sent Events
+  on `http.server`, which is a few hundred lines of exactly the code
+  everyone gets subtly wrong. The poll loop itself didn't change character
+  — it runs as an asyncio task in the same process, so this is still one
+  container doing one job, and `API_ENABLED=false` skips the web stack
+  entirely for an alerting-only instance.
+- The image also carries the **`docker compose` CLI**, copied from
+  Docker's own published CLI image, for lifecycle operations — see
+  [Why the Compose CLI](#why-the-compose-cli).
 - No build step (unlike, say, TypeScript) — `pip install -r
-  requirements.txt` and run. Keeps the Docker image small and the
-  deploy loop fast.
+  requirements.txt` and run.
 
-Total third-party footprint: one package (`docker`, which itself pulls in
-`requests`).
+Third-party footprint: `docker` (which pulls in `requests`), plus
+`fastapi`/`uvicorn` for the API.
 
 ## Configuration (environment variables)
 
@@ -121,6 +149,22 @@ inline too).
 | `TRAFFIC_MIN_RATE_LINES_PER_MIN` | `2` | Floor so a near-zero baseline doesn't trivially count as "5x." |
 | `ALERT_ON_RECOVERY` | `true` | Send a follow-up push when a problem clears. |
 | `LOG_LEVEL` | `INFO` | `DEBUG`/`INFO`/`WARNING`/`ERROR`. |
+| `PHASE_TRACKING_ENABLED` | `true` | Parse `[phase:…]` markers out of container logs — see "Phase reporting". |
+| `PHASE_STALE_SECONDS` | `900` | A phase older than this is reported as unknown rather than current. |
+| `API_ENABLED` | `true` | Serve the control API. `false` = alerting only, nothing listens on a port. |
+| `API_HOST` / `API_PORT` | `0.0.0.0` / `8000` | Where the API listens. |
+| `PROJECTS_FILE` | *(empty)* | JSON registry of controllable projects. **Without it nothing can be started or stopped** — see "Controlling projects". |
+| `LEASES_FILE` | `/data/leases.json` | Where demo leases persist. Must be on a volume that outlives the container. |
+| `CONTROL_TOKEN` | *(empty)* | Bearer token for owner operations. Empty = those are refused for everyone. `openssl rand -hex 32`. |
+| `DOCKER_HOST` | `unix:///var/run/docker.sock` | Read by both docker-py and the bundled Compose CLI. On the NAS: `tcp://socket-proxy:2375`. |
+| `ACTIVE_POLL_INTERVAL_SECONDS` | `5` | Poll interval used while a project is mid-operation or holding a lease, so a dashboard updates believably. |
+| `DEFAULT_TTL_MINUTES` | `60` | How long a guest's demo runs before it's stopped automatically. |
+| `MAX_CONCURRENT_GUEST_PROJECTS` | `1` | How many guest-started projects may run at once. |
+| `MAX_CONCURRENT_OPERATIONS` | `2` | How many compose operations may run in parallel. |
+| `TRUST_PROXY_HEADERS` | `false` | Believe `X-Forwarded-For`. Only turn on behind a reverse proxy you control — see "Security notes". |
+| `GUEST_RATE_WINDOW_SECONDS` | `600` | Window for the per-IP request limit below. |
+| `GUEST_MAX_REQUESTS_PER_WINDOW` | `3` | Control requests one address may make per window. |
+| `GUEST_MAX_REQUESTS_PER_DAY` | `20` | Control requests one address may make per day. |
 
 No ntfy credentials are invented here — `NTFY_TOPIC` is yours to pick.
 Until you set one, `NOTIFY_MODE=console` (the default) lets you run and
@@ -166,6 +210,162 @@ less likely to collide with a timestamp or port number than "429" alone.
 | Warning problem (no-data/rate-limited/traffic-spike/custom) | 3 | ⚠️ `warning` |
 | Warning recovered | 2 | ✅ `white_check_mark` |
 
+## Phase reporting
+
+Docker knows a container is "running" and, if it defines a HEALTHCHECK,
+"healthy". Neither tells you that flight-tracker's agent is a third of the
+way through backfilling positions — and for a dashboard where somebody is
+waiting on a demo to become usable, that's the only interesting part.
+
+So apps say what they're doing, on their own stdout:
+
+```
+[phase:populating_data] global sweep 1/3
+```
+
+docker-monitor parses those out of the log lines it is *already* fetching
+for the checks above — no status endpoint per app, no extra Docker calls,
+and an app that says nothing simply has no phase, which is an honest
+answer rather than a guess.
+
+| Phase | Means |
+|---|---|
+| `starting_up` | Booting; not usable yet. |
+| `populating_data` | Doing real work — fetching, importing, backfilling. |
+| `ready` | Up and serving. |
+| `idle` | Up, nothing to do. |
+| `degraded` | Running but impaired (upstream rate-limited, a dependency down). |
+| `shutting_down` | On the way out. |
+
+Anything outside that list is ignored rather than passed through: this is
+a protocol between the apps and the dashboard, and a UI can't rank a phase
+it has never heard of. The detail text after the marker is free-form and
+shown as-is.
+
+**Two rules for apps emitting these** (see the implementations in
+[flight-tracker](../flight-tracker) and [dinner-planner](../dinner-planner)):
+
+1. **Emit on transition only**, never once per loop iteration. A marker
+   per iteration of a few-second refresh loop buries the real logs and
+   trips the traffic-spike detector above.
+2. **Never re-emit someone else's phase in marker form.** docker-monitor
+   itself follows this: when it logs another container's phase it writes
+   `phase=populating_data container=…`, not the `[phase:…]` marker. Its
+   own stdout is a container log stream too, and echoing the marker would
+   make a monitor watching a monitor attribute the phase to the wrong
+   thing — the same self-referential feedback shape as the rate-limit
+   false positive documented above.
+
+A phase older than `PHASE_STALE_SECONDS` (default 900) is treated as
+unknown rather than current: a container that said "populating_data" an
+hour ago and has been silent since is not still populating data.
+
+## Controlling projects
+
+### What a "project" is
+
+A Compose project — the thing `docker compose ls` lists and the unit a
+person actually thinks in ("start the flight tracker"), rather than the
+five containers underneath it. Grouping is automatic, from the
+`com.docker.compose.project` label Compose puts on everything it creates.
+
+### The registry, and why it exists
+
+Discovery alone isn't enough for control, for two reasons: a project that
+is fully *down* has no containers to read labels off, and nothing in
+Docker says who is allowed to start what. So `PROJECTS_FILE` points at a
+JSON registry — see [`projects.example.json`](projects.example.json) for a
+documented, working example:
+
+```json
+{
+  "flight-tracker": {
+    "display_name": "Flight Tracker",
+    "compose_file": "/stacks/flight-tracker/docker-compose.yml",
+    "demo_url": "http://nas.local:8090",
+    "guest_controllable": true,
+    "default_ttl_minutes": 60,
+    "max_ttl_minutes": 120,
+    "ready_container": "flight_tracker_frontend"
+  }
+}
+```
+
+**A project not in the registry is visible but never controllable.** If
+it's running on the host it shows up in the API read-only; nothing can
+start or stop it. That asymmetry is the main safety property here — a
+public endpoint must not be able to touch an arbitrary stack on the NAS,
+and "is it listed?" is a much simpler question to get right than "should
+this caller be allowed to do this?".
+
+### Guests and owners
+
+| | Guest (no token) | Owner (`Authorization: Bearer $CONTROL_TOKEN`) |
+|---|---|---|
+| Read status | ✅ | ✅ |
+| Start/stop `guest_controllable` projects | ✅ (rate-limited, capped, leased) | ✅ |
+| Start/stop anything else controllable | ❌ | ✅ |
+| Restart | ❌ | ✅ |
+| Update (pull + recreate) | ❌ | ✅ |
+
+With no `CONTROL_TOKEN` set, owner operations are refused for *everyone*.
+"No token" never means "everyone is the owner".
+
+Guests are additionally bounded by:
+
+- **A lease.** Starting a project grants one (`DEFAULT_TTL_MINUTES`,
+  default 60, clamped to the project's `max_ttl_minutes`). When it
+  expires, the project is stopped. This is the backstop the whole feature
+  rests on, so leases are persisted to disk — a monitor restart must not
+  orphan a running stack. On startup anything running without a lease is
+  *adopted* with a default-length one, deliberately erring toward stopping
+  a stack that might have been started by hand.
+- **A concurrency cap** (`MAX_CONCURRENT_GUEST_PROJECTS`, default 1).
+- **Per-IP rate and daily limits**, in the same shape flight-tracker
+  already uses for its public `POST /api/agents/restart`. Callers on a
+  private/loopback address are exempt from all of it — the owner testing
+  from their own LAN isn't who any of this exists for.
+
+### Endpoints
+
+| Endpoint | Auth | Notes |
+|---|---|---|
+| `GET /api/projects` | none | Every project, with state, phase and lease. |
+| `GET /api/projects/{name}` | none | Adds per-container detail and the last operation's result. |
+| `GET /api/events` | none | Server-Sent Events: full state on connect, again on every change, heartbeat every 15s. |
+| `POST /api/projects/{name}/start` | guest | Body `{"ttl_minutes": 60}`, optional. |
+| `POST /api/projects/{name}/stop` | guest | |
+| `POST /api/projects/{name}/restart` | owner | |
+| `POST /api/projects/{name}/update` | owner | `pull`, then `up -d`. |
+| `GET /healthz` | none | |
+| `GET /api/docs` | none | Generated OpenAPI browser. |
+
+Start/stop/restart/update all return immediately and do the work in the
+background — `docker compose up -d` on a cold stack takes tens of seconds,
+well past any sensible proxy timeout. Watch `/api/events` (or poll) for
+the result; the project reports `starting`/`stopping` while an operation
+is in flight, and a second operation on a busy project is refused with a
+409 rather than racing the first.
+
+### Why the Compose CLI
+
+Lifecycle operations shell out to `docker compose`, which is the one place
+this service doesn't use the Engine API directly. "Update" honestly means
+"pull a newer image and recreate the container with the same
+configuration", and doing that through the raw API means re-deriving a
+container's full create spec from its inspect output — networks, aliases,
+mounts, env, every Compose label — Watchtower-style. Compose already does
+that correctly, `docker compose pull && up -d` is literally the documented
+update procedure in flight-tracker's own deploy README, and using the same
+command a human would use keeps the two from drifting apart.
+
+The CLI still never touches the host socket: `DOCKER_HOST` points at the
+socket proxy, same as docker-py.
+
+Note that **stop uses `stop`, not `down`**. `down` removes containers and
+would leave the next start re-initialising an empty database — every demo
+would then sit in "populating data" from scratch.
+
 ## ntfy setup
 
 ### Subscribing on a phone
@@ -210,10 +410,16 @@ to the more complex option unconditionally.
 
 ```bash
 cp .env.example .env
+cp projects.example.json projects.json   # edit: what may be controlled
 # Leave NOTIFY_MODE=console to start — no ntfy server needed yet.
 docker compose up -d --build
 docker compose logs -f docker-monitor
+curl localhost:8000/api/projects         # the control API
 ```
+
+The compose files of whatever you list in `projects.json` need to be
+readable inside the container — point `STACKS_DIR` at the directory
+holding them (it's mounted read-only at `/stacks`).
 
 This also brings up the bundled `ntfy` service (published on
 `NTFY_PORT`, default `8080`). To actually receive pushes: set
@@ -238,11 +444,36 @@ source .venv/bin/activate
 python -m pytest tests/ -v
 ```
 
-19 tests: the container-state de-dup state machine (`test_rules.py`), the
-log-content watcher's three checks — pattern matching, no-data, traffic
-spike (`test_logwatch.py`, using a `FakeContainer` stub, no real Docker
-daemon needed) — and the ntfy severity→priority/tag mapping
+106 tests, no real Docker daemon needed by any of them. The original 19
+cover the container-state de-dup state machine (`test_rules.py`), the
+log-content watcher's three checks (`test_logwatch.py`, using a
+`FakeContainer` stub) and the ntfy severity→priority/tag mapping
 (`test_notifier.py`).
+
+The rest cover the control plane, weighted toward the things whose failure
+is expensive rather than merely annoying:
+
+- `test_api.py` — the guest/owner boundary, driven end-to-end through the
+  real FastAPI app over a fake daemon. A guest can't restart, can't
+  update, can't start a project that isn't marked `guest_controllable`,
+  can't get past the concurrency cap or the rate limit; an absent
+  `CONTROL_TOKEN` disables owner operations rather than enabling them for
+  everyone; and an expired lease stops the project.
+- `test_leases.py` — the TTL backstop and the two ways it silently fails:
+  state lost across a restart, and a stack running with no lease at all.
+- `test_phases.py` — marker parsing, the closed vocabulary, staleness, and
+  the no-echo rule (a rendered phase must not parse back as a marker).
+- `test_projects.py` — grouping, registry loading, and that a project
+  discovered on the host is visible but never controllable.
+- `test_lifecycle.py` — the exact compose command each operation would
+  run, failure handling, and that a second operation on a busy project is
+  refused.
+
+One thing deliberately isn't unit-tested: the live SSE stream. Starlette's
+`TestClient` drives the app through a blocking portal, and a
+`StreamingResponse` that never ends by design has no clean client-side
+teardown — the test hangs rather than fails. The frame *format* is
+unit-tested; the stream itself is verified with `curl -N` below.
 
 ### Verified against a live stack
 
@@ -311,6 +542,49 @@ exhibit either failure mode):
    specifically (state watching is unaffected — Docker's own state carries
    no alert-describing text, so it has no equivalent feedback path).
 
+### Verifying the control API
+
+The control plane was verified against this dev machine's real Docker
+daemon (29.8.1 / Compose 5.5.1), driving a throwaway Compose project that
+prints phase markers on a schedule, rather than only against the fakes in
+`test_api.py`:
+
+1. `GET /api/projects` listed the registry project as `stopped` and
+   `controllable` while no container for it existed at all — the case that
+   makes the registry necessary in the first place.
+2. `POST .../start` with `{"ttl_minutes": 2}` returned immediately with a
+   lease; the project reported `starting` while `docker compose up -d`
+   ran, then `running`.
+3. Its phase moved `starting_up` → `populating_data` → `idle` as the
+   container logged each marker, with the detail text (`"fetching window
+   1/3"`) carried through. `demo_ready` was `false` during `starting_up`
+   and `true` from `populating_data` on — i.e. Docker health alone would
+   have said "ready" a poll earlier, which is the exact lie the phase
+   check exists to catch.
+4. **The first marker was picked up on the container's first sighting**,
+   not the one after, confirming the backfill in `logwatch.py` — without
+   it a freshly started stack shows no phase for up to two poll intervals,
+   which is most of the time anyone is actually watching.
+5. `curl -N /api/events` delivered the initial state, further frames as
+   state changed, and `: keep-alive` heartbeats in between.
+6. Auth: `update` without a token → 401, with a wrong token → 403, with
+   the right one → 200; an unknown project → 404.
+7. **The lease expired and the project stopped itself** — `running` →
+   `stopping` → `stopped`, the lease released, with
+   `Lease for demo-stack expired after 2 minutes — stopping it` in the
+   log. This is the single behaviour the guest-start feature rests on.
+8. Restarting docker-monitor with the stack up and the lease file deleted
+   → the project was **adopted** with a fresh 60-minute lease, rather than
+   left running indefinitely.
+9. Starting an already-running project extended its lease *without*
+   recreating the container (verified by comparing `StartedAt` before and
+   after) — a visitor arriving mid-demo shouldn't restart it under the
+   person already using it.
+10. **Alerting still works alongside all of this**: the auto-stop in step 7
+    produced exactly one `PROBLEM: demo_stack_worker (stopped)` push at
+    priority 5, unchanged from before this feature existed.
+
+
 ## NAS deployment
 
 On the NAS, this runs the same way as any other Compose service already
@@ -348,22 +622,60 @@ it).
   delete/comment out the bundled `ntfy` service in `docker-compose.yml` —
   one ntfy server is plenty for a whole NAS, you don't need a second one
   per monitored stack.
-- **The socket mount itself.** `/var/run/docker.sock:/var/run/docker.sock:ro`
-  is the same on the NAS as here — it's host-Docker-daemon-specific, not
-  per-stack, so this one `docker-monitor` container watches every stack on
-  the NAS at once. You don't need one instance per stack.
+- **How it reaches Docker.** On the NAS there is no socket mount at all:
+  `deploy/docker-compose.yml` runs a socket-proxy sidecar and points
+  `DOCKER_HOST` at it. Either way it's host-daemon-specific, not
+  per-stack, so this one `docker-monitor` container watches (and controls)
+  every stack on the NAS at once. You don't need one instance per stack.
+- **The registry and your stacks directory.** Control needs two read-only
+  mounts that the dev compose file fakes with examples: a
+  `projects.json` (start from `projects.example.json`) and the directory
+  holding each project's compose file. Without them, projects are listed
+  but nothing can be started.
 
 ### Security notes
 
-- The Docker socket is mounted **read-only** in the bind-mount sense
-  (`:ro`) — but note this only stops the *bind mount itself* from being
-  remounted read-write from inside the container; the Docker Engine API
-  reachable over that socket is a full read/write control-plane API
-  (start/stop/exec/create/delete anything on the host). This tool only
-  ever calls the read endpoints (`list`, `inspect`, `logs`), but nothing at
-  the socket level *enforces* that — it's enforced by this codebase not
-  calling anything else. Anyone who can exec into this container has the
-  same host-level power any container with socket access does.
+**This service can now start and stop containers, and is meant to be
+reachable from the public internet. Read this section before deploying it
+that way.**
+
+- **The socket is no longer read-only, because it can't be.** Starting a
+  container is a write operation. Earlier versions mounted the socket
+  `:ro` and only called `list`/`inspect`/`logs`; that's no longer true, and
+  pretending otherwise would be the dangerous kind of stale documentation.
+- **The socket proxy helps, but it is not the boundary.**
+  `deploy/docker-compose.yml` puts
+  [docker-socket-proxy](https://github.com/Tecnativa/docker-socket-proxy)
+  in front of the daemon, and docker-monitor never sees
+  `/var/run/docker.sock` at all. That blocks `exec` (the difference
+  between managing containers and running arbitrary commands inside any of
+  them, including ones holding secrets), plus build, swarm, secrets and
+  configs. But `CONTAINERS=1` + `POST=1` — which `docker compose up`
+  requires — is still enough to create a privileged container, and a
+  privileged container is the host. **Treat the proxy as narrowing the
+  blast radius of a compromised monitor, not as containing one.**
+- **The actual boundary for public traffic is the API.** Two things do the
+  work: a caller without the `CONTROL_TOKEN` can only touch projects
+  explicitly marked `guest_controllable` in the registry, and the registry
+  is a read-only mount this process cannot rewrite. No endpoint accepts a
+  compose file path, a container name, or a command — callers name a
+  project, and the project must already be listed. Everything else (rate
+  limits, the concurrency cap, the TTL) is about cost and abuse, not about
+  containment.
+- **`TRUST_PROXY_HEADERS` is off by default and should stay off unless you
+  have a reverse proxy.** With the API port reachable directly, a client
+  that can set its own `X-Forwarded-For` gets a fresh identity per request
+  and walks straight past every per-IP limit. Turn it on only when
+  something you control terminates connections in front of it — the
+  portfolio's nginx does, which is why the dashboard reaches this at
+  `/lab-api/` rather than by its own port.
+- **Set a `CONTROL_TOKEN`.** Without one, `restart` and `update` are
+  refused for everybody (the safe direction, but probably not what you
+  want). Generate it with `openssl rand -hex 32`; don't reuse anything.
+- **The `CONTROL_TOKEN` is a bearer token over whatever transport you put
+  this behind.** On plain HTTP over a LAN that's a reasonable trade; if
+  this is reachable from the internet, terminate TLS in front of it, or
+  the token is readable by anything on the path.
 - `cap_drop: [ALL]` and `security_opt: [no-new-privileges:true]` in
   `docker-compose.yml` (on both `docker-monitor` and the bundled `ntfy`
   service) reduce what a compromised process here could do *beyond* the
@@ -390,15 +702,29 @@ docker_monitor/
   config.py       # env var parsing (+ a tiny .env loader for local runs)
   dockerstate.py  # Docker SDK calls -> normalized ContainerSnapshot, include/exclude filtering
   rules.py        # container-state alert/de-dup state machine (pure, unit-tested, no Docker dependency)
-  logwatch.py     # log-content watcher: no-data, pattern matching, traffic-spike (pure logic + Engine API log fetch)
+  logwatch.py     # log-content watcher: no-data, patterns, traffic-spike; also the one log fetch phases ride on
   notifier.py     # console dry-run notifier + real ntfy notifier, severity -> priority/tags
-  main.py         # poll loop entry point, wires state engine + log watcher + notifier together
+  phases.py       # [phase:...] marker parsing, per-container tracking, project aggregation
+  projects.py     # compose-label grouping + the registry -> the project view the API serves
+  leases.py       # time-limited demo claims, persisted; startup reconciliation
+  lifecycle.py    # start/stop/restart/update via the `docker compose` CLI, off the request thread
+  ratelimit.py    # per-IP guest limits and client-IP resolution
+  service.py      # one poll feeding alerting, phases and the project view; the control entry points
+  api.py          # FastAPI app: read endpoints, SSE, control endpoints, guest/owner split
+  main.py         # entry point: uvicorn + poll task, or the plain poll loop if API_ENABLED=false
 tests/
-  test_rules.py    # unit tests for rules.py
-  test_logwatch.py # unit tests for logwatch.py (FakeContainer stub, no real Docker daemon)
-  test_notifier.py # unit tests for the priority/tag mapping
+  test_rules.py     # container-state alert/de-dup state machine
+  test_logwatch.py  # log-content checks (FakeContainer stub, no real Docker daemon)
+  test_notifier.py  # priority/tag mapping
+  test_phases.py    # marker parsing, staleness, aggregation, the no-echo rule
+  test_projects.py  # grouping, registry loading, project state, demo_ready
+  test_leases.py    # TTL expiry, persistence across restart, reconciliation
+  test_lifecycle.py # the compose commands that would run, failures, concurrency
+  test_api.py       # the guest/owner boundary end-to-end over a fake daemon
 Dockerfile
-docker-compose.yml   # bundles docker-monitor + a self-hosted ntfy service
+docker-compose.yml       # dev: builds from source, host socket, API on localhost
+projects.example.json    # documented example of the project registry
+deploy/                  # NAS: prebuilt image + socket proxy
 .env.example
 ```
 
@@ -453,6 +779,26 @@ docker-compose.yml   # bundles docker-monitor + a self-hosted ntfy service
   simplicity.
 - **ntfy only, for now.** Slack/Discord/webhook/email channels would slot
   in easily behind the same `notifier.py` interface if wanted later.
+- **Lifecycle is `stop`, never `down`.** Stopping a project leaves its
+  containers and volumes in place, so the next start is fast and
+  flight-tracker's accumulated position history survives. The cost is that
+  a project stopped this way still holds disk. If you want a true teardown,
+  that's a deliberate `docker compose down` by hand — this API won't do it,
+  because a guest-reachable endpoint that can delete volumes is a
+  different risk category entirely.
+- **A guest can stop a demo someone else started.** With a concurrency cap
+  of 1 and no accounts, the alternative is worse: a visitor who closes the
+  tab would otherwise block everyone for the rest of the TTL. Revisit if
+  it ever gets used enough for that to be annoying.
+- **Adoption errs toward stopping things.** A running, guest-controllable
+  project with no lease on record gets one at startup, which means a stack
+  *you* started by hand can be stopped an hour later if it happens to be
+  in the registry as guest-controllable. Mark anything that should stay up
+  `always_on`, which exempts it from leases entirely.
+- **No per-guest identity.** Rate limits are per IP, which is
+  approximately right for home-scale traffic and wrong behind carrier NAT
+  or a shared office address. The TTL and concurrency cap are the real
+  cost ceiling; the per-IP limits just make casual abuse tedious.
 - **ntfy topic access control is documented, not configured.** This
   project doesn't decide LAN-only vs. internet-reachable for you — see
   "ntfy setup → Security notes."

@@ -33,6 +33,15 @@ from .rules import Event
 
 logger = logging.getLogger("docker_monitor")
 
+# On first sighting of a container we normally start the log checkpoint at
+# "now", so we never replay a long-running container's entire backlog. A
+# container that only just started is the exception: its whole history is
+# a few seconds long, and reading it is the difference between the
+# dashboard showing "starting up" immediately and showing nothing until
+# the poll after next. Only matters for phase markers — alerting still
+# baselines from "now" either way.
+PHASE_BACKFILL_SECONDS = 120
+
 ALERT_NO_DATA = "log:no_data"
 ALERT_TRAFFIC_SPIKE = "log:traffic_spike"
 
@@ -130,11 +139,24 @@ class _ContainerLogTrack:
 
 
 class LogWatcher:
-    def __init__(self, cfg):
+    """Fetches each running container's new log lines once per poll and
+    runs the content checks over them.
+
+    Two consumers ride on that one fetch: the alert checks (no-data,
+    patterns, traffic spike) and — if a PhaseTracker is supplied — app
+    phase markers. `alerts_enabled=False` keeps the fetch and the phase
+    parsing while producing no alert events, which is what
+    LOG_MONITORING_ENABLED=false means now that phases exist: no log-based
+    *alerting*, but the dashboard still gets to say what things are doing.
+    """
+
+    def __init__(self, cfg, phase_tracker=None, alerts_enabled: bool = True):
         self._cfg = cfg
         self._tracks: dict = {}
-        self._patterns = _default_patterns(cfg)
-        if cfg.log_patterns_file:
+        self._phase_tracker = phase_tracker
+        self._alerts_enabled = alerts_enabled
+        self._patterns = _default_patterns(cfg) if alerts_enabled else []
+        if alerts_enabled and cfg.log_patterns_file:
             self._patterns += _load_patterns_file(cfg.log_patterns_file)
 
     def evaluate(self, running_watched: list, now: float = None) -> list:
@@ -155,14 +177,28 @@ class LogWatcher:
                 # no-data detection has a sane starting point (effectively
                 # a grace period) instead of firing on containers we've
                 # simply never checked before.
-                self._tracks[snap.name] = _ContainerLogTrack(
+                track = _ContainerLogTrack(
                     checkpoint_ts=now, first_seen_ts=now, last_activity_ts=now
                 )
-                continue
+                self._tracks[snap.name] = track
+                if not self._should_backfill(snap, now):
+                    continue
+                # Just-started container: rewind the checkpoint to its
+                # start so this first fetch picks up whatever phase it
+                # announced on boot. The alerting baseline is unaffected —
+                # first_seen_ts/last_activity_ts still say "now", so the
+                # grace period and no-data threshold behave as before.
+                track.checkpoint_ts = snap.started_at
 
             lines = self._fetch_new_lines(container, track, now)
             if lines:
                 track.last_activity_ts = now
+
+            if self._phase_tracker is not None:
+                self._phase_tracker.observe(snap.name, lines, now)
+
+            if not self._alerts_enabled:
+                continue
 
             events.extend(self._evaluate_patterns(track, snap.name, lines))
             events.extend(self._evaluate_no_data(track, snap.name, now))
@@ -178,6 +214,13 @@ class LogWatcher:
                 del self._tracks[name]
 
         return events
+
+    @staticmethod
+    def _should_backfill(snap, now: float) -> bool:
+        return (
+            snap.started_at is not None
+            and 0 <= now - snap.started_at <= PHASE_BACKFILL_SECONDS
+        )
 
     def _fetch_new_lines(self, container, track: _ContainerLogTrack, now: float) -> list:
         try:
