@@ -1,0 +1,288 @@
+# The always-on half of the Lab, as ONE pasteable Compose project:
+# socket proxy + ntfy + docker-monitor + the portfolio site.
+#
+# Built for UGOS's Docker app ("Project → Create project → paste into
+# Compose configuration"), which creates one project per paste. Everything
+# below is inlined — image tags, settings, and even docker-monitor's
+# project registry (see the `configs:` block at the bottom) — so nothing
+# has to be uploaded or edited on the NAS filesystem afterwards.
+#
+# ---------------------------------------------------------------------
+# WHAT THIS IS *NOT*
+# ---------------------------------------------------------------------
+# The demo stacks themselves (flight-tracker, and dinner-planner later)
+# are deliberately NOT here. They are separate Compose projects that
+# docker-monitor starts and stops on demand — that's the whole point, and
+# putting them in this file would mean they run 24/7, which is what the
+# Lab exists to avoid.
+#
+# Create flight-tracker as its OWN project, from
+# flight-tracker/deploy/docker-compose.yml. Then this stack manages it.
+#
+# ---------------------------------------------------------------------
+# THE TWO PASTES, AND THE ONE NAME THAT MUST MATCH
+# ---------------------------------------------------------------------
+#   Project 1   Name: anything (e.g. "lab")   ← this file
+#   Project 2   Name: flight-tracker          ← flight-tracker/deploy/
+#                                                docker-compose.yml
+#
+# **Project 2 must be named exactly `flight-tracker`** — the same string
+# as the registry key at the bottom of this file. The GUI passes its Name
+# box to Compose as the project name, and that overrides the `name:` line
+# inside the pasted YAML. Get it wrong and nothing errors: the dashboard
+# starts a SECOND, parallel copy of the stack under the name it expected,
+# fighting the first over ports. Rename the project, not the registry key,
+# if they ever drift.
+#
+# Deploy project 2 once so its compose file lands on disk under
+# STACKS_DIR, then stop it — from then on the dashboard runs it on demand.
+#
+# ---------------------------------------------------------------------
+# BEFORE YOU DEPLOY — three things, in order
+# ---------------------------------------------------------------------
+# 1. Make the GHCR packages pullable. They're private by default:
+#    github.com/users/petterfranzen/packages → each package → Package
+#    settings → Change visibility → Public. (Or `docker login ghcr.io` on
+#    the NAS with a PAT carrying read:packages.) Needed for
+#    docker-monitor, portfolio, and both flight-tracker images.
+#
+# 2. Set STACKS_DIR below to the directory that CONTAINS your Compose
+#    projects' folders. On UGOS that's the parent of the "Storage path"
+#    you pick when creating a project — commonly /volume1/docker. The
+#    registry at the bottom then refers to
+#    /stacks/<project folder>/docker-compose.yml.
+#    Get this wrong and the Lab lists flight-tracker but fails to start it
+#    with a "no configuration file" error.
+#
+# 3. Set CONTROL_TOKEN to something you generate yourself:
+#        openssl rand -hex 32
+#    Leave it empty and restart/update are refused for everyone — the safe
+#    direction, but you won't be able to update images from the dashboard.
+#
+# ---------------------------------------------------------------------
+# SECURITY — read before exposing this outside your LAN
+# ---------------------------------------------------------------------
+# The whole design assumes the portfolio's nginx is the ONLY way in.
+# docker-monitor's own API port is therefore NOT published below; the
+# portfolio reaches it over this project's internal network. If you put a
+# tunnel or reverse proxy in front of anything, point it at the portfolio
+# port and nothing else, and terminate TLS there — CONTROL_TOKEN is a
+# bearer token and plain HTTP leaks it to anything on the path.
+#
+# TRUST_PROXY_HEADERS is on below, which is only correct *because* that
+# nginx is the sole entrance: it rewrites X-Forwarded-For itself. If you
+# ever publish docker-monitor's port directly, turn this off, or a visitor
+# can forge the header and walk past every per-IP guest limit.
+#
+# The socket proxy narrows what a compromised monitor could do (no exec,
+# no build, no secrets) but is NOT a containment boundary: `compose up`
+# needs POST + CONTAINERS, which is enough to create a privileged
+# container. The real boundary is the guest/owner split plus the registry
+# below — a project not listed there can never be started or stopped
+# through the API. See the repo README's "Security notes".
+
+name: lab
+
+services:
+  # Everything docker-monitor does to Docker goes through here, so it
+  # never holds the raw socket itself.
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: lab-socket-proxy
+    restart: unless-stopped
+    environment:
+      # Reads: container state, inspect, logs — the alerting half.
+      CONTAINERS: 1
+      # Writes: what `docker compose up/stop/pull` needs.
+      POST: 1
+      IMAGES: 1
+      NETWORKS: 1
+      VOLUMES: 1
+      # Compose negotiates API version on startup.
+      PING: 1
+      VERSION: 1
+      INFO: 1
+      # Explicitly off. EXEC is the important one — the difference between
+      # managing containers and running arbitrary commands inside any of
+      # them, including ones holding secrets.
+      EXEC: 0
+      BUILD: 0
+      COMMIT: 0
+      SWARM: 0
+      SECRETS: 0
+      CONFIGS: 0
+      NODES: 0
+      PLUGINS: 0
+      SYSTEM: 0
+      AUTH: 0
+      DISTRIBUTION: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    expose:
+      - "2375"
+    cap_drop:
+      - ALL
+    cap_add:
+      # haproxy inside this image binds a port then drops privileges.
+      - CHOWN
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+
+  # Push notifications for container problems. Already run an ntfy server
+  # elsewhere on the NAS? Delete this service and point NTFY_URL at it.
+  ntfy:
+    image: binwiederhier/ntfy:latest
+    container_name: lab-ntfy
+    command: serve
+    restart: unless-stopped
+    volumes:
+      - ntfy-data:/var/lib/ntfy
+    ports:
+      - "${NTFY_PORT:-8080}:80"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  docker-monitor:
+    image: ghcr.io/petterfranzen/docker-monitor:${IMAGE_TAG:-latest}
+    container_name: lab-docker-monitor
+    restart: unless-stopped
+    depends_on:
+      - socket-proxy
+      - ntfy
+    # No `ports:` on purpose — see the security note in the header. The
+    # portfolio reaches this at http://docker-monitor:8000 on this
+    # project's own network.
+    environment:
+      # ---- notifications ------------------------------------------------
+      # "console" logs what WOULD be pushed, so you can confirm it sees
+      # your containers before wiring up real pushes. Switch to "ntfy" and
+      # set a hard-to-guess NTFY_TOPIC once you're happy.
+      NOTIFY_MODE: ${NOTIFY_MODE:-console}
+      NTFY_URL: ${NTFY_URL:-http://ntfy:80}
+      NTFY_TOPIC: ${NTFY_TOPIC:-}
+      ALERT_ON_RECOVERY: ${ALERT_ON_RECOVERY:-true}
+
+      # ---- talking to Docker ---------------------------------------------
+      # The proxy, never the raw socket. Read by both the Python client and
+      # the bundled `docker compose` CLI.
+      DOCKER_HOST: tcp://socket-proxy:2375
+
+      # ---- polling ---------------------------------------------------------
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-30}
+      # Used instead of the above while something is mid-operation or
+      # holding a lease, so watching a stack boot doesn't feel frozen.
+      ACTIVE_POLL_INTERVAL_SECONDS: ${ACTIVE_POLL_INTERVAL_SECONDS:-5}
+
+      # ---- app phases -------------------------------------------------------
+      PHASE_TRACKING_ENABLED: ${PHASE_TRACKING_ENABLED:-true}
+      PHASE_STALE_SECONDS: ${PHASE_STALE_SECONDS:-900}
+
+      # ---- control API -------------------------------------------------------
+      API_ENABLED: "true"
+      API_PORT: "8000"
+      PROJECTS_FILE: /config/projects.json
+      LEASES_FILE: /data/leases.json
+      # REQUIRED for restart/update. Generate: openssl rand -hex 32
+      CONTROL_TOKEN: ${CONTROL_TOKEN:-}
+      # Correct only because the portfolio's nginx is the sole entrance —
+      # see the header.
+      TRUST_PROXY_HEADERS: "true"
+
+      # ---- guest limits -------------------------------------------------------
+      # How long a visitor's demo runs before stopping itself.
+      DEFAULT_TTL_MINUTES: ${DEFAULT_TTL_MINUTES:-60}
+      MAX_CONCURRENT_GUEST_PROJECTS: ${MAX_CONCURRENT_GUEST_PROJECTS:-1}
+      MAX_CONCURRENT_OPERATIONS: ${MAX_CONCURRENT_OPERATIONS:-2}
+      GUEST_RATE_WINDOW_SECONDS: ${GUEST_RATE_WINDOW_SECONDS:-600}
+      GUEST_MAX_REQUESTS_PER_WINDOW: ${GUEST_MAX_REQUESTS_PER_WINDOW:-3}
+      GUEST_MAX_REQUESTS_PER_DAY: ${GUEST_MAX_REQUESTS_PER_DAY:-20}
+
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      # Leases outlive the container, or a NAS reboot orphans whatever a
+      # visitor started and it runs until someone notices.
+      - monitor-data:/data
+      # The demo stacks' Compose files. READ-ONLY on purpose: this process
+      # must never be able to rewrite the files describing what it runs.
+      - ${STACKS_DIR:-/volume1/docker}:/stacks:ro
+    configs:
+      # The registry of what may be controlled, materialised from the
+      # `configs:` block at the bottom of this file — so it's part of the
+      # YAML you pasted, not a file to manage separately.
+      - source: projects
+        target: /config/projects.json
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  portfolio:
+    image: ghcr.io/petterfranzen/portfolio:${IMAGE_TAG:-latest}
+    container_name: lab-portfolio
+    restart: unless-stopped
+    depends_on:
+      - docker-monitor
+    ports:
+      # The only port that needs to be reachable by a visitor.
+      - "${PORTFOLIO_PORT:-8081}:80"
+    cap_drop:
+      - ALL
+    cap_add:
+      # nginx's entrypoint chowns its cache directories and its workers
+      # drop from root to the nginx user, so these three are genuinely
+      # required — with a bare `cap_drop: ALL` the container restart-loops
+      # on `chown("/var/cache/nginx/client_temp") failed: Operation not
+      # permitted` before it ever serves a request.
+      - CHOWN
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+
+configs:
+  # docker-monitor's project registry. Inlined so the whole deployment is
+  # one paste — see the repo's projects.example.json for every available
+  # key and what it does.
+  #
+  # TWO RULES that will bite you otherwise:
+  #
+  #  1. The key must match the Compose project name the stack actually
+  #     runs under — the `name:` at the top of its compose file, which is
+  #     `flight-tracker` for the one below. NOT the folder name, if they
+  #     differ.
+  #
+  #  2. compose_file must point at a file that runs from PREBUILT images.
+  #     Nothing here builds anything (no toolchain in the image, and the
+  #     socket proxy sets BUILD: 0), so a compose file using `build:` fails
+  #     at `up`. Use each repo's deploy/ compose file.
+  #
+  # A project NOT listed here can still be *seen* in the dashboard if it's
+  # running, but can never be started or stopped through the API. That
+  # asymmetry is deliberate — it's what stops a public endpoint from
+  # touching an arbitrary stack on the NAS.
+  #
+  # dinner-planner is absent on purpose: it has no deploy/ compose file
+  # publishing prebuilt images yet, so it cannot be controlled from here.
+  projects:
+    content: |
+      {
+        "flight-tracker": {
+          "display_name": "Flight Tracker",
+          "description": "Live aircraft positions polled from OpenSky and replayed on a vector map.",
+          "compose_file": "/stacks/flight-tracker/docker-compose.yml",
+          "demo_url": "http://CHANGE-ME:8090",
+          "repo_url": "https://github.com/petterfranzen/flight-tracker",
+          "guest_controllable": true,
+          "default_ttl_minutes": 60,
+          "max_ttl_minutes": 120,
+          "ready_container": "flight_tracker_frontend"
+        }
+      }
+
+volumes:
+  ntfy-data:
+  monitor-data:
