@@ -291,6 +291,14 @@ documented, working example:
 }
 ```
 
+**The compose file must run from prebuilt images.** This never builds
+anything — there's no build toolchain in the image, and the socket proxy
+sets `BUILD=0` — so a compose file using `build:` fails at `up`. Point
+`compose_file` at each project's `deploy/` compose file (which pulls from
+GHCR), not the repo-root one most of them use for local development. A
+project that has no `deploy/` compose file yet can't be controlled from
+here at all, however it's configured.
+
 **A project not in the registry is visible but never controllable.** If
 it's running on the host it shows up in the API read-only; nothing can
 start or stop it. That asymmetry is the main safety property here — a
