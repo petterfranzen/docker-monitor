@@ -1,5 +1,17 @@
 # Deploying to the UGREEN NAS
 
+> **Deploying the whole Lab (monitor + dashboard) at once?** Use
+> [`lab-stack.yml`](lab-stack.yml) instead of `docker-compose.yml`. It's
+> one Compose project containing the socket proxy, ntfy, docker-monitor
+> and the portfolio site, with the project registry inlined — built to be
+> pasted straight into UGOS's "Create project" box, with nothing to upload
+> or edit on the NAS afterwards. Read its header before deploying; there
+> are three things to set.
+>
+> `docker-compose.yml` below remains the right file for an
+> alerting-and-control instance on its own, without the dashboard.
+
+
 The image is built once in CI and pulled by the NAS — nothing gets built
 on the NAS itself.
 
