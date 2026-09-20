@@ -215,10 +215,42 @@ class MonitorService:
                 logger.info("%s", render_project_phase(view.name, view.phase, view.phase_detail))
 
     def _enforce_leases(self, now: float) -> None:
-        """Stop anything whose time is up. This is the backstop the whole
-        guest-start feature rests on: without it a visitor's demo runs
-        until someone notices."""
+        """Stop anything whose time is up, and drop leases that have
+        outlived what they were holding.
+
+        The first is the backstop the whole guest-start feature rests on:
+        without it a visitor's demo runs until someone notices.
+
+        The second matters just as much and is less obvious. A lease
+        counts against MAX_CONCURRENT_GUEST_PROJECTS whether or not the
+        project it names is actually running — so a stack that crashed, or
+        a `compose up` that failed, would hold the only demo slot for the
+        rest of its TTL while nothing ran at all, and every later visitor
+        would be told someone else was using it. Found by the portfolio's
+        own journey test, which started a demo, was interrupted, and then
+        could not start anything again.
+
+        Releasing is safe here because a project mid-start reports
+        `starting`, not `stopped` (see build_views), and the busy check
+        below covers the window before the first poll sees its containers.
+        """
         views = {v.name: v for v in self.views()}
+
+        for lease in list(self._leases.all()):
+            view = views.get(lease.project)
+            gone = view is None or (
+                view.state == projects_mod.STATE_STOPPED
+                and not self._lifecycle.is_busy(lease.project)
+            )
+            if gone:
+                logger.info(
+                    "Releasing lease for %s: it is not running (stopped by hand, "
+                    "failed to start, or crashed) — holding the lease would block "
+                    "the demo slot for nothing",
+                    lease.project,
+                )
+                self._leases.release(lease.project)
+
         for lease in self._leases.expired(now):
             view = views.get(lease.project)
             if view is None or view.state == projects_mod.STATE_STOPPED:

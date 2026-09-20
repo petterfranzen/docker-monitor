@@ -357,6 +357,57 @@ def test_a_lease_that_has_not_expired_leaves_the_project_alone(make_client):
     assert operations == []
 
 
+def test_a_lease_for_a_project_that_is_not_running_is_released(make_client):
+    """Regression: a lease counts against the concurrency cap whether or
+    not its project is actually up. A stack that crashed — or a start that
+    failed — used to hold the only demo slot for the rest of its TTL while
+    nothing ran, and every later visitor was told someone else was using
+    it. Found by the portfolio's journey test."""
+    containers = [FakeContainer("ft_frontend", "flight-tracker", "frontend", health="healthy")]
+    client, service, _ = make_client(containers)
+    service.poll_once()
+    client.post("/api/projects/flight-tracker/start", headers=PUBLIC_CLIENT)
+    assert service._leases.get("flight-tracker") is not None
+
+    # The stack goes away without anyone telling the API (crash, or a
+    # `docker compose stop` typed by hand on the NAS).
+    service._client.containers.containers.clear()
+    service.poll_once()
+
+    assert service._leases.get("flight-tracker") is None
+    assert client.get("/api/projects").json()["active_guest_projects"] == 0
+
+
+def test_a_slot_freed_that_way_can_be_used_again(make_client):
+    containers = [FakeContainer("ft_frontend", "flight-tracker", "frontend", health="healthy")]
+    client, service, operations = make_client(containers)
+    service.poll_once()
+    client.post("/api/projects/flight-tracker/start", headers=PUBLIC_CLIENT)
+
+    service._client.containers.containers.clear()
+    service.poll_once()
+    operations.clear()
+
+    response = client.post("/api/projects/flight-tracker/start", headers={"x-forwarded-for": "1.1.1.1"})
+    assert response.status_code == 200
+    assert operations == [("flight-tracker", "start")]
+
+
+def test_a_lease_is_not_released_while_the_project_is_still_starting(make_client):
+    """The other side of that fix: between granting a lease and the first
+    poll that sees containers, the project legitimately has none — and
+    dropping its lease there would hand the slot to someone else mid-start."""
+    client, service, _ = make_client()
+    service.poll_once()
+    client.post("/api/projects/flight-tracker/start", headers=PUBLIC_CLIENT)
+
+    # Still no containers, and the operation is recorded as in flight.
+    service._lifecycle._in_flight["flight-tracker"] = "start"
+    service.poll_once()
+
+    assert service._leases.get("flight-tracker") is not None
+
+
 def test_stopping_releases_the_lease(make_client):
     containers = [FakeContainer("ft_frontend", "flight-tracker", "frontend", health="healthy")]
     client, service, _ = make_client(containers)
