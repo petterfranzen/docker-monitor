@@ -20,6 +20,24 @@
 # flight-tracker/deploy/docker-compose.yml. Then this stack manages it.
 #
 # ---------------------------------------------------------------------
+# THE TWO PASTES, AND THE ONE NAME THAT MUST MATCH
+# ---------------------------------------------------------------------
+#   Project 1   Name: anything (e.g. "lab")   ← this file
+#   Project 2   Name: flight-tracker          ← flight-tracker/deploy/
+#                                                docker-compose.yml
+#
+# **Project 2 must be named exactly `flight-tracker`** — the same string
+# as the registry key at the bottom of this file. The GUI passes its Name
+# box to Compose as the project name, and that overrides the `name:` line
+# inside the pasted YAML. Get it wrong and nothing errors: the dashboard
+# starts a SECOND, parallel copy of the stack under the name it expected,
+# fighting the first over ports. Rename the project, not the registry key,
+# if they ever drift.
+#
+# Deploy project 2 once so its compose file lands on disk under
+# STACKS_DIR, then stop it — from then on the dashboard runs it on demand.
+#
+# ---------------------------------------------------------------------
 # BEFORE YOU DEPLOY — three things, in order
 # ---------------------------------------------------------------------
 # 1. Make the GHCR packages pullable. They're private by default:
