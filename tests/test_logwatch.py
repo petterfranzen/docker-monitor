@@ -177,3 +177,64 @@ def test_dropped_container_resets_tracking():
     # Not in this poll's watched/running list anymore.
     watcher.evaluate([], now=10.0)
     assert "c1" not in watcher._tracks
+
+
+# -- log fetch failures ---------------------------------------------------
+
+
+class _UnreadableContainer:
+    """A container whose logging driver can't be read — what the Engine API
+    answers for `--log-driver none`, journald, syslog and friends."""
+
+    def __init__(self, name="quiet-one"):
+        self.name = name
+        self.id = name
+        self.calls = 0
+
+    def logs(self, **_):
+        self.calls += 1
+        raise Exception(
+            '501 Server Error: Not Implemented ("configured logging driver '
+            'does not support reading")'
+        )
+
+
+class _BrokenContainer:
+    def __init__(self, name="flaky"):
+        self.name = name
+        self.id = name
+        self.calls = 0
+
+    def logs(self, **_):
+        self.calls += 1
+        raise Exception("connection reset by peer")
+
+
+def test_unreadable_logging_driver_is_given_up_on_after_one_attempt():
+    """Found running against a real host: a stray `--log-driver none`
+    container produced a full traceback on every single poll. It's a
+    permanent property of the container, not a transient failure."""
+    watcher = LogWatcher(make_cfg())
+    container = _UnreadableContainer()
+    snapshot = snap(container.name)
+
+    watcher.evaluate([(container, snapshot)], now=1000.0)  # first sighting, no fetch
+    for i in range(5):
+        watcher.evaluate([(container, snapshot)], now=1010.0 + i * 10)
+
+    assert container.calls == 1, "should stop trying after the first 501"
+
+
+def test_other_fetch_failures_are_retried_but_logged_once():
+    """A transient failure is worth retrying — just not worth a traceback
+    per poll for as long as it lasts."""
+    watcher = LogWatcher(make_cfg())
+    container = _BrokenContainer()
+    snapshot = snap(container.name)
+
+    watcher.evaluate([(container, snapshot)], now=1000.0)
+    for i in range(3):
+        watcher.evaluate([(container, snapshot)], now=1010.0 + i * 10)
+
+    assert container.calls == 3
+    assert container.name in watcher._fetch_failures_logged
