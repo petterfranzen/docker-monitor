@@ -9,8 +9,17 @@ against plain data, with no real Docker daemon involved.
 from __future__ import annotations
 
 import fnmatch
+import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Optional
+
+
+# Compose stamps these on every container it creates; they're what lets
+# this group containers into projects without being told about any
+# specific stack (see projects.py).
+LABEL_PROJECT = "com.docker.compose.project"
+LABEL_SERVICE = "com.docker.compose.service"
 
 
 @dataclass(frozen=True)
@@ -24,6 +33,19 @@ class ContainerSnapshot:
     restart_policy: str  # always / unless-stopped / on-failure / "" (none)
     restart_count: int
     labels: dict
+    # Epoch seconds the container last entered "running", or None if it
+    # never has / Docker reports the zero value. Used to decide whether a
+    # container is fresh enough that reading its log history from the start
+    # is worthwhile — see logwatch.py's phase backfill.
+    started_at: Optional[float] = None
+
+    @property
+    def compose_project(self) -> Optional[str]:
+        return self.labels.get(LABEL_PROJECT)
+
+    @property
+    def compose_service(self) -> Optional[str]:
+        return self.labels.get(LABEL_SERVICE)
 
 
 def _label_matches(labels: dict, spec: str) -> bool:
@@ -55,6 +77,22 @@ def is_watched(snapshot: ContainerSnapshot, cfg) -> bool:
     return True
 
 
+def _parse_started_at(value) -> Optional[float]:
+    """Docker reports StartedAt as RFC3339Nano, and as the zero time
+    ("0001-01-01T00:00:00Z") for a container that has never run. Python's
+    fromisoformat can't take more than 6 fractional digits, so trim."""
+    if not value or value.startswith("0001-01-01"):
+        return None
+    text = value.replace("Z", "+00:00")
+    match = re.match(r"(.*\.\d{1,6})\d*(\+\d{2}:\d{2})$", text)
+    if match:
+        text = match.group(1) + match.group(2)
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return None
+
+
 def snapshot_from_container(container) -> ContainerSnapshot:
     attrs = container.attrs
     state = attrs.get("State", {}) or {}
@@ -71,6 +109,7 @@ def snapshot_from_container(container) -> ContainerSnapshot:
         restart_policy=(host_config.get("RestartPolicy") or {}).get("Name", ""),
         restart_count=attrs.get("RestartCount", 0),
         labels=config.get("Labels") or {},
+        started_at=_parse_started_at(state.get("StartedAt")),
     )
 
 

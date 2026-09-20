@@ -33,6 +33,23 @@ from .rules import Event
 
 logger = logging.getLogger("docker_monitor")
 
+# On first sighting of a container we normally start the log checkpoint at
+# "now", so we never replay a long-running container's entire backlog. A
+# container that only just started is the exception: its whole history is
+# a few seconds long, and reading it is the difference between the
+# dashboard showing "starting up" immediately and showing nothing until
+# the poll after next. Only matters for phase markers — alerting still
+# baselines from "now" either way.
+PHASE_BACKFILL_SECONDS = 120
+
+# Some containers simply cannot have their logs read: a container started
+# with `--log-driver none` (or any non-reading driver — journald, syslog,
+# gelf...) makes the Engine API's logs endpoint answer 501. That's a fact
+# about the container, not a transient failure, so retrying it every poll
+# forever just fills our own log with tracebacks — seen for real against a
+# stray `--log-driver none` container on the dev machine.
+_UNREADABLE_LOG_MARKERS = ("does not support reading", "not implemented")
+
 ALERT_NO_DATA = "log:no_data"
 ALERT_TRAFFIC_SPIKE = "log:traffic_spike"
 
@@ -130,11 +147,29 @@ class _ContainerLogTrack:
 
 
 class LogWatcher:
-    def __init__(self, cfg):
+    """Fetches each running container's new log lines once per poll and
+    runs the content checks over them.
+
+    Two consumers ride on that one fetch: the alert checks (no-data,
+    patterns, traffic spike) and — if a PhaseTracker is supplied — app
+    phase markers. `alerts_enabled=False` keeps the fetch and the phase
+    parsing while producing no alert events, which is what
+    LOG_MONITORING_ENABLED=false means now that phases exist: no log-based
+    *alerting*, but the dashboard still gets to say what things are doing.
+    """
+
+    def __init__(self, cfg, phase_tracker=None, alerts_enabled: bool = True):
         self._cfg = cfg
         self._tracks: dict = {}
-        self._patterns = _default_patterns(cfg)
-        if cfg.log_patterns_file:
+        # Containers whose logs can never be read (see above), and ones
+        # whose last fetch failed for some other reason — the latter are
+        # retried, the former are not.
+        self._unreadable: set = set()
+        self._fetch_failures_logged: set = set()
+        self._phase_tracker = phase_tracker
+        self._alerts_enabled = alerts_enabled
+        self._patterns = _default_patterns(cfg) if alerts_enabled else []
+        if alerts_enabled and cfg.log_patterns_file:
             self._patterns += _load_patterns_file(cfg.log_patterns_file)
 
     def evaluate(self, running_watched: list, now: float = None) -> list:
@@ -155,14 +190,34 @@ class LogWatcher:
                 # no-data detection has a sane starting point (effectively
                 # a grace period) instead of firing on containers we've
                 # simply never checked before.
-                self._tracks[snap.name] = _ContainerLogTrack(
+                track = _ContainerLogTrack(
                     checkpoint_ts=now, first_seen_ts=now, last_activity_ts=now
                 )
+                self._tracks[snap.name] = track
+                if not self._should_backfill(snap, now):
+                    continue
+                # Just-started container: rewind the checkpoint to its
+                # start so this first fetch picks up whatever phase it
+                # announced on boot. The alerting baseline is unaffected —
+                # first_seen_ts/last_activity_ts still say "now", so the
+                # grace period and no-data threshold behave as before.
+                track.checkpoint_ts = snap.started_at
+
+            if snap.name in self._unreadable:
+                # No log stream to read: no phases, and none of the
+                # log-content checks apply. Container *state* alerting is
+                # unaffected — that comes from rules.py, not from here.
                 continue
 
             lines = self._fetch_new_lines(container, track, now)
             if lines:
                 track.last_activity_ts = now
+
+            if self._phase_tracker is not None:
+                self._phase_tracker.observe(snap.name, lines, now)
+
+            if not self._alerts_enabled:
+                continue
 
             events.extend(self._evaluate_patterns(track, snap.name, lines))
             events.extend(self._evaluate_no_data(track, snap.name, now))
@@ -179,6 +234,40 @@ class LogWatcher:
 
         return events
 
+    def _record_fetch_failure(self, name: str, exc: Exception) -> None:
+        """Report a log-fetch failure once rather than once per poll.
+
+        A container with an unreadable logging driver is permanently so,
+        and a container that's genuinely broken will fail every poll for as
+        long as it stays broken — either way the traceback is worth
+        printing once, not every interval forever.
+        """
+        message = str(exc).lower()
+        if any(marker in message for marker in _UNREADABLE_LOG_MARKERS):
+            self._unreadable.add(name)
+            logger.info(
+                "Not reading logs from %s: its logging driver doesn't support "
+                "reading (e.g. --log-driver none/journald). Container state "
+                "alerting still covers it; log patterns and app phases do not.",
+                name,
+            )
+            return
+
+        if name not in self._fetch_failures_logged:
+            self._fetch_failures_logged.add(name)
+            logger.warning(
+                "Failed to fetch logs for %s (will keep trying, logged once): %s",
+                name,
+                exc,
+            )
+
+    @staticmethod
+    def _should_backfill(snap, now: float) -> bool:
+        return (
+            snap.started_at is not None
+            and 0 <= now - snap.started_at <= PHASE_BACKFILL_SECONDS
+        )
+
     def _fetch_new_lines(self, container, track: _ContainerLogTrack, now: float) -> list:
         try:
             raw = container.logs(
@@ -188,10 +277,11 @@ class LogWatcher:
                 stdout=True,
                 stderr=True,
             )
-        except Exception:
-            logger.exception("Failed to fetch logs for %s", container.name)
+        except Exception as exc:
+            self._record_fetch_failure(container.name, exc)
             return []
         track.checkpoint_ts = now
+        self._fetch_failures_logged.discard(container.name)
 
         lines = []
         for raw_line in raw.decode("utf-8", errors="replace").splitlines():

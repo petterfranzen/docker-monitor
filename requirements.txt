@@ -1,1 +1,9 @@
+# Engine API client (container state, inspect, logs).
 docker>=7,<8
+
+# The control API (docker_monitor/api.py). Only needed when API_ENABLED is
+# true, which is the default; an alerting-only instance never imports
+# these, so a deployment that sets API_ENABLED=false still runs if they
+# somehow fail to install.
+fastapi>=0.115,<1
+uvicorn>=0.30,<1

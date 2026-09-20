@@ -11,3 +11,7 @@ venv/
 
 # OS
 .DS_Store
+
+# Local control-plane config (copy projects.example.json to make one)
+projects.json
+stacks/

@@ -7,6 +7,7 @@ docker-compose.yml, so this loader only matters when running
 """
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -68,6 +69,28 @@ class Config:
     traffic_grace_period_seconds: int
     traffic_min_rate_lines_per_min: float
 
+    # App phase reporting (see docker_monitor/phases.py).
+    phase_tracking_enabled: bool
+    phase_stale_seconds: int
+
+    # Control plane: the HTTP API, project registry and demo leases
+    # (see docker_monitor/api.py, projects.py, leases.py).
+    api_enabled: bool
+    api_host: str
+    api_port: int
+    control_token: str
+    projects_file: str
+    leases_file: str
+    docker_host: str
+    active_poll_interval_seconds: int
+    default_ttl_minutes: int
+    max_concurrent_guest_projects: int
+    max_concurrent_operations: int
+    trust_proxy_headers: bool
+    guest_rate_window_seconds: int
+    guest_max_requests_per_window: int
+    guest_max_requests_per_day: int
+
     @staticmethod
     def load() -> "Config":
         _load_dotenv()
@@ -117,8 +140,41 @@ class Config:
             traffic_min_rate_lines_per_min=float(
                 env.get("TRAFFIC_MIN_RATE_LINES_PER_MIN", "2")
             ),
+            phase_tracking_enabled=_bool(env.get("PHASE_TRACKING_ENABLED", ""), True),
+            phase_stale_seconds=int(env.get("PHASE_STALE_SECONDS", "900")),
+            api_enabled=_bool(env.get("API_ENABLED", ""), True),
+            api_host=env.get("API_HOST", "0.0.0.0").strip(),
+            api_port=int(env.get("API_PORT", "8000")),
+            control_token=env.get("CONTROL_TOKEN", "").strip(),
+            projects_file=env.get("PROJECTS_FILE", "").strip(),
+            leases_file=env.get("LEASES_FILE", "/data/leases.json").strip(),
+            # docker-py picks DOCKER_HOST up from the environment by itself;
+            # this copy is what gets handed to the `docker compose`
+            # subprocess, which runs with a deliberately minimal env.
+            docker_host=env.get("DOCKER_HOST", "unix:///var/run/docker.sock").strip(),
+            active_poll_interval_seconds=int(env.get("ACTIVE_POLL_INTERVAL_SECONDS", "5")),
+            default_ttl_minutes=int(env.get("DEFAULT_TTL_MINUTES", "60")),
+            max_concurrent_guest_projects=int(
+                env.get("MAX_CONCURRENT_GUEST_PROJECTS", "1")
+            ),
+            max_concurrent_operations=int(env.get("MAX_CONCURRENT_OPERATIONS", "2")),
+            trust_proxy_headers=_bool(env.get("TRUST_PROXY_HEADERS", ""), False),
+            guest_rate_window_seconds=int(env.get("GUEST_RATE_WINDOW_SECONDS", "600")),
+            guest_max_requests_per_window=int(
+                env.get("GUEST_MAX_REQUESTS_PER_WINDOW", "3")
+            ),
+            guest_max_requests_per_day=int(env.get("GUEST_MAX_REQUESTS_PER_DAY", "20")),
         )
 
         if cfg.notify_mode == "ntfy" and not cfg.ntfy_topic:
             raise ValueError("NOTIFY_MODE=ntfy requires NTFY_TOPIC")
+        if cfg.api_enabled and cfg.projects_file and not cfg.control_token:
+            # Not fatal: a deployment may genuinely want a read-only,
+            # guest-only dashboard with no privileged operations at all.
+            # But it's worth saying out loud, because "update" and
+            # "restart" silently refusing every caller looks like a bug.
+            logging.getLogger("docker_monitor").warning(
+                "No CONTROL_TOKEN set: owner-only operations (restart, update) "
+                "will be refused for every caller. Set one to enable them."
+            )
         return cfg

@@ -1,0 +1,62 @@
+{
+  "_comment": [
+    "PROJECTS_FILE — the registry of Compose projects this instance may control.",
+    "Copy to projects.json and edit. Every key is a Compose project name, which",
+    "must match the project the stack actually runs under (`docker compose ls`, or",
+    "the `name:` field at the top of its compose file).",
+    "",
+    "A project NOT listed here is still visible in the API if it's running on the",
+    "host, but can never be started or stopped through it. That asymmetry is the",
+    "point: a public endpoint should not be able to touch an arbitrary stack.",
+    "",
+    "Keys starting with an underscore are ignored, so this comment is legal JSON.",
+    "",
+    "  compose_file        Path INSIDE this container (see the /stacks mount).",
+    "                      No compose_file means the project is read-only.",
+    "  guest_controllable  Unauthenticated visitors may start/stop it. Everything",
+    "                      else needs the CONTROL_TOKEN.",
+    "  always_on           Never leased, never auto-stopped, never guest-startable.",
+    "  default_ttl_minutes How long a guest's lease lasts. The 60-minute default is",
+    "                      the backstop the whole guest-start feature rests on.",
+    "  max_ttl_minutes     Ceiling on what a caller may request.",
+    "  ready_container     Whose health decides 'the demo is actually usable'.",
+    "                      Without it, every container must be running.",
+    "  demo_url            Where the dashboard sends a visitor once it's ready.",
+    "",
+    "PREREQUISITE, easy to miss: the compose file must run from PREBUILT images.",
+    "This never builds anything — there's no build toolchain in the image and the",
+    "socket proxy sets BUILD=0 — so a compose file using `build:` will fail at",
+    "`up`. Use each project's deploy/ compose file (pulling from GHCR), not the",
+    "repo-root one most of them use for local development."
+  ],
+
+  "flight-tracker": {
+    "display_name": "Flight Tracker",
+    "description": "Live aircraft positions over the Baltic, polled from OpenSky and replayed on a vector map.",
+    "compose_file": "/stacks/flight-tracker/deploy/docker-compose.yml",
+    "demo_url": "http://nas.local:8090",
+    "repo_url": "https://github.com/petterfranzen/flight-tracker",
+    "guest_controllable": true,
+    "default_ttl_minutes": 60,
+    "max_ttl_minutes": 120,
+    "ready_container": "flight_tracker_frontend"
+  },
+
+  "_dinner-planner-not-yet": [
+    "Left commented out (leading underscore) deliberately: dinner-planner has no",
+    "deploy/ compose file yet, and its root one uses `build:`, which cannot work",
+    "here — see the PREREQUISITE note above. Once it publishes images to GHCR and",
+    "gains a deploy/docker-compose.yml, rename this key to \"dinner-planner\" and",
+    "replace this array with the object below.",
+    {
+      "display_name": "Dinner Planner",
+      "description": "Weekly meal planning for two, with recipe import and a consolidated shopping list.",
+      "compose_file": "/stacks/dinner-planner/deploy/docker-compose.yml",
+      "demo_url": "http://nas.local:5174",
+      "repo_url": "https://github.com/petterfranzen/dinner-planner",
+      "guest_controllable": true,
+      "default_ttl_minutes": 60,
+      "max_ttl_minutes": 120
+    }
+  ]
+}
